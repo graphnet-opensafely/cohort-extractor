@@ -292,8 +292,8 @@ class GraphnetBackend:
             primary_table = "#population"
             patient_id_expr = ColumnExpression("#population.patient_id")
         else:
-            primary_table = "Patient"
-            patient_id_expr = ColumnExpression("Patient.Patient_ID")
+            primary_table = "SharedCare.[Patient_Link] PL WITH (NOLOCK) "
+            patient_id_expr = ColumnExpression("PL.[PK_Patient_Link_ID]")
         # Insert `patient_id` as the first column
         output_columns = dict(patient_id=patient_id_expr, **output_columns)
         output_columns_str = ",\n          ".join(
@@ -819,7 +819,7 @@ class GraphnetBackend:
     
     def patients_registered_as_of(self, reference_date):
         """
-        All patients registed on the given date
+        All patients registered on the given date
         """
         return self.patients_registered_with_one_practice_between(
                 reference_date, reference_date
@@ -842,18 +842,31 @@ class GraphnetBackend:
             # *started* using SystmOne.  If they've stopped using it, then we
             # won't have their data in the TPP database at all.
             extra_condition = f"  AND Organisation.GoLiveDate <= {start_date_sql}"
+
+        # 26/05/2021 GPH-2805 Graphnet variant of SQL
         return f"""
-        SELECT DISTINCT Patient.Patient_ID AS patient_id, 1 AS value
-        FROM Patient
-        INNER JOIN RegistrationHistory
-        ON RegistrationHistory.Patient_ID = Patient.Patient_ID
-        INNER JOIN Organisation
-        ON RegistrationHistory.Organisation_ID = Organisation.Organisation_ID
+        SELECT DISTINCT PL.[PK_Patient_Link_ID] AS patient_id, 1 AS value
+        FROM SharedCare.[Patient_Link] PL WITH (NOLOCK)
         {date_joins}
-        WHERE StartDate <= {start_date_sql} AND EndDate > {end_date_sql}
+        WHERE ISNULL(PL.[DateOfRegistration],PL.[CreateDate]) BETWEEN {start_date_sql} AND {end_date_sql}
+        AND PL.[Deleted] = 'N'
+        AND ISNULL(PL.[DeathDate],'29991231') > {end_date_sql}
         {extra_condition}
         """
-    
+
+        # return f"""
+        # SELECT DISTINCT Patient.Patient_ID AS patient_id, 1 AS value
+        # FROM Patient
+        # INNER JOIN RegistrationHistory
+        # ON RegistrationHistory.Patient_ID = Patient.Patient_ID
+        # INNER JOIN Organisation
+        # ON RegistrationHistory.Organisation_ID = Organisation.Organisation_ID
+        # {date_joins}
+        # WHERE StartDate <= {start_date_sql} AND EndDate > {end_date_sql}
+        # {extra_condition}
+        # """
+
+
     def patients_with_complete_history_between(self, start_date, end_date):
         """
         All patients for which we have a full set of records between the given
@@ -953,11 +966,14 @@ class GraphnetBackend:
             include_date_of_match=False,
             ignore_missing_values=False,
     ):
+        # 26/05/2021 GPH-2805 Can just hardcode these
+        from_table = "SharedCare.[Normalised_Coding]"
+        code_column = "[SnomedConceptID]"
         codelist_table, codelist_queries = self.create_codelist_table(
                 codelist, codes_are_case_sensitive
         )
         date_condition, date_joins = self.get_date_condition(
-                from_table, "ConsultationDate", between
+                from_table, "[ActivityDate]", between
         )
         ignored_day_condition, extra_queries = self._these_codes_occur_on_same_day(
                 from_table, ignore_days_where_these_codes_occur, between
@@ -1003,22 +1019,23 @@ class GraphnetBackend:
             if from_table == "CodedEvent_SNOMED":
                 from_table_id_col = "CodedEvent_ID"
             else:
-                from_table_id_col = f"{from_table}_ID"
-            
+                from_table_id_col = f"[PK_Normalised_Coding_ID]"
+
+            # 26/05/2021 GPH-2805 Graphnet variant of SQL
             sql = f"""
             SELECT
-              Patient_ID AS patient_id,
+              [FK_Patient_Link_ID] AS patient_id,
               {column_definition} AS {column_name},
-              ConsultationDate AS date
+              [ActivityDate] AS date
             FROM (
-              SELECT {from_table}.Patient_ID, {column_definition}, ConsultationDate,
+              SELECT NC.[FK_Patient_Link_ID], {column_definition}, NC.[ActivityDate],
               ROW_NUMBER() OVER (
-                PARTITION BY {from_table}.Patient_ID
-                ORDER BY ConsultationDate {ordering}, {from_table_id_col}
+                PARTITION BY NC.[FK_Patient_Link_ID]
+                ORDER BY NC.[ActivityDate] {ordering}, {from_table_id_col}
               ) AS rownum
-              FROM {from_table}{additional_join}
+              FROM {from_table} NC WITH (NOLOCK) {additional_join}
               INNER JOIN {codelist_table}
-              ON {code_column} = {codelist_table}.code
+              ON NC.{code_column} COLLATE Latin1_General_CS_AS = {codelist_table}.code COLLATE Latin1_General_CS_AS
               {date_joins}
               WHERE {date_condition}
                 AND NOT {ignored_day_condition}
@@ -1029,18 +1046,55 @@ class GraphnetBackend:
         else:
             sql = f"""
             SELECT
-              {from_table}.Patient_ID AS patient_id,
+              {from_table}.[FK_Patient_Link_ID] AS patient_id,
               {column_definition} AS {column_name},
-              {date_aggregate}(ConsultationDate) AS date
+              {date_aggregate}([ActivityDate]) AS date
             FROM {from_table}{additional_join}
             INNER JOIN {codelist_table}
-            ON {code_column} = {codelist_table}.code
+            ON {code_column} COLLATE Latin1_General_BIN = {codelist_table}.code COLLATE Latin1_General_BIN
             {date_joins}
             WHERE {date_condition}
               AND NOT {ignored_day_condition}
               AND {missing_value_condition}
-            GROUP BY {from_table}.Patient_ID
+            GROUP BY {from_table}.[FK_Patient_Link_ID]
             """
+        #
+        #     sql = f"""
+        #     SELECT
+        #       Patient_ID AS patient_id,
+        #       {column_definition} AS {column_name},
+        #       ConsultationDate AS date
+        #     FROM (
+        #       SELECT {from_table}.Patient_ID, {column_definition}, ConsultationDate,
+        #       ROW_NUMBER() OVER (
+        #         PARTITION BY {from_table}.Patient_ID
+        #         ORDER BY ConsultationDate {ordering}, {from_table_id_col}
+        #       ) AS rownum
+        #       FROM {from_table}{additional_join}
+        #       INNER JOIN {codelist_table}
+        #       ON {code_column} = {codelist_table}.code
+        #       {date_joins}
+        #       WHERE {date_condition}
+        #         AND NOT {ignored_day_condition}
+        #         AND {missing_value_condition}
+        #     ) t
+        #     WHERE rownum = 1
+        #     """
+        # else:
+        #     sql = f"""
+        #     SELECT
+        #       {from_table}.Patient_ID AS patient_id,
+        #       {column_definition} AS {column_name},
+        #       {date_aggregate}(ConsultationDate) AS date
+        #     FROM {from_table}{additional_join}
+        #     INNER JOIN {codelist_table}
+        #     ON {code_column} = {codelist_table}.code
+        #     {date_joins}
+        #     WHERE {date_condition}
+        #       AND NOT {ignored_day_condition}
+        #       AND {missing_value_condition}
+        #     GROUP BY {from_table}.Patient_ID
+        #     """
         
         return codelist_queries + extra_queries + [sql]
     
@@ -1114,11 +1168,14 @@ class GraphnetBackend:
             episode_defined_as=None,
             ignore_missing_values=False,
     ):
+        # 26/05/2021 GPH-2805 Just want to hard code these
+        from_table = "SharedCare.[Normalised_Coding]"
+        code_column = "[SnomedConceptID]"
         codelist_table, codelist_queries = self.create_codelist_table(
                 codelist, case_sensitive=True
         )
         date_condition, date_joins = self.get_date_condition(
-                from_table, "ConsultationDate", between
+                from_table, "[ActivityDate]", between
         )
         ignored_day_condition, extra_queries = self._these_codes_occur_on_same_day(
                 from_table, ignore_days_where_these_codes_occur, between
@@ -1137,36 +1194,65 @@ class GraphnetBackend:
             washout_period = int(match.group(1))
         else:
             washout_period = 0
-        
+        # 26/05/2021 GPH-2805 Graphnet variant of SQL
         sql = f"""
         SELECT
-          t.Patient_ID AS patient_id,
+          t.[FK_Patient_Link_ID] AS patient_id,
           SUM(is_new_episode) AS number_of_episodes
         FROM (
             SELECT
-              {from_table}.Patient_ID,
+              NC.[FK_Patient_Link_ID],
               CASE
                 WHEN
                   DATEDIFF(
                     day,
-                    LAG(ConsultationDate) OVER (
-                      PARTITION BY {from_table}.Patient_ID ORDER BY ConsultationDate
+                    LAG(NC.[ActivityDate]) OVER (
+                      PARTITION BY NC.[FK_Patient_Link_ID] ORDER BY NC.[ActivityDate]
                     ),
-                    ConsultationDate
+                    NC.[ActivityDate]
                   ) <= {washout_period}
                 THEN 0
                 ELSE 1
               END AS is_new_episode
-            FROM {from_table}
+            FROM SharedCare.[NormalisedCoding] NC WITH (NOLOCK) 
             INNER JOIN {codelist_table}
-            ON {code_column} = {codelist_table}.code
+            ON NC.[SnomedConceptID] COLLATE Latin1_General_BIN = {codelist_table}.code COLLATE Latin1_General_BIN
             {date_joins}
             WHERE {date_condition}
               AND NOT {ignored_day_condition}
               AND {missing_value_condition}
         ) t
-        GROUP BY t.Patient_ID
+        GROUP BY t.[FK_Patient_Link_ID]
         """
+        # sql = f"""
+        # SELECT
+        #   t.Patient_ID AS patient_id,
+        #   SUM(is_new_episode) AS number_of_episodes
+        # FROM (
+        #     SELECT
+        #       {from_table}.Patient_ID,
+        #       CASE
+        #         WHEN
+        #           DATEDIFF(
+        #             day,
+        #             LAG(ConsultationDate) OVER (
+        #               PARTITION BY {from_table}.Patient_ID ORDER BY ConsultationDate
+        #             ),
+        #             ConsultationDate
+        #           ) <= {washout_period}
+        #         THEN 0
+        #         ELSE 1
+        #       END AS is_new_episode
+        #     FROM {from_table}
+        #     INNER JOIN {codelist_table}
+        #     ON {code_column} = {codelist_table}.code
+        #     {date_joins}
+        #     WHERE {date_condition}
+        #       AND NOT {ignored_day_condition}
+        #       AND {missing_value_condition}
+        # ) t
+        # GROUP BY t.Patient_ID
+        # """
         return codelist_queries + extra_queries + [sql]
     
     def _these_codes_occur_on_same_day(self, joined_table, codelist, between):
@@ -1217,16 +1303,23 @@ class GraphnetBackend:
         return condition, queries
     
     def patients_registered_practice_as_of(self, date, returning=None):
+        # 26/05/2021 GPH-2805 If MSOA needed, want additional join
+        msoa_join = ""
         if returning == "stp_code":
-            column = "STPCode"
+            column = "GP.[HighLevelHealthGeography]"
         # "msoa" is the correct option here, "msoa_code" is supported for
         # backwards compatibility
         elif returning in ("msoa", "msoa_code"):
-            column = "MSOACode"
+            # 26/05/2021 GPH-2805 Alt source for MSOA
+            column = "PC.[MSOA11]"
+            msoa_join = f"""
+            LEFT JOIN SharedCare.[Reference_Postcodes] PC WITH (NOLOCK) 
+                    ON REPLACE(GP.[PostCode],' ','') = PC.[LK_Postcode]
+            """
         elif returning == "nuts1_region_name":
-            column = "Region"
+            column = "GP.[Region]"
         elif returning == "pseudo_id":
-            column = "Organisation_ID"
+            column = "GP.[OrganisationCode]"
         else:
             raise ValueError(f"Unsupported `returning` value: {returning}")
         # Note that current registrations are recorded with an EndDate of
@@ -1234,24 +1327,45 @@ class GraphnetBackend:
         # the most recent start date. If there are several with the same start
         # date we use the longest one (i.e. with the latest end date).
         date_sql, date_joins = self.get_date_sql("RegistrationHistory", date)
+        # 26/05/2021 GPH-2805 Graphnet variant of SQL
         return f"""
         SELECT
-          t.Patient_ID AS patient_id,
-          Organisation.{column} AS {returning}
+          t.[FK_Patient_Link_ID] AS patient_id,
+          {column} AS {returning}
         FROM (
-          SELECT RegistrationHistory.Patient_ID, Organisation_ID,
+          SELECT GPH.[FK_Patient_Link_ID], GPH.[FK_Reference_GP_Practice_ID],
           ROW_NUMBER() OVER (
-            PARTITION BY RegistrationHistory.Patient_ID
-            ORDER BY StartDate DESC, EndDate DESC, Registration_ID
+            PARTITION BY GPH.[FK_Patient_Link_ID]
+            ORDER BY GPH.[StartDate] DESC
           ) AS rownum
-          FROM RegistrationHistory
+          FROM SharedCare.[Patient_GP_History] GPH WITH (NOLOCK) 
           {date_joins}
-          WHERE StartDate <= {date_sql} AND EndDate > {date_sql}
+          WHERE GPH.[StartDate] <= {date_sql} AND ISNULL(GPH.[EndDate],'29991231') > {date_sql}
+          AND GPH.[Deleted] = 'N'
         ) t
-        LEFT JOIN Organisation
-        ON Organisation.Organisation_ID = t.Organisation_ID
+        LEFT JOIN SharedCare.[Reference_GP_Practice] GP WITH (NOLOCK) 
+        ON GP.[PK_Reference_GP_Practice_ID] = t.[FK_Reference_GP_Practice_ID]
+        {msoa_join}
         WHERE t.rownum = 1
         """
+        # return f"""
+        # SELECT
+        #   t.Patient_ID AS patient_id,
+        #   Organisation.{column} AS {returning}
+        # FROM (
+        #   SELECT RegistrationHistory.Patient_ID, Organisation_ID,
+        #   ROW_NUMBER() OVER (
+        #     PARTITION BY RegistrationHistory.Patient_ID
+        #     ORDER BY StartDate DESC, EndDate DESC, Registration_ID
+        #   ) AS rownum
+        #   FROM RegistrationHistory
+        #   {date_joins}
+        #   WHERE StartDate <= {date_sql} AND EndDate > {date_sql}
+        # ) t
+        # LEFT JOIN Organisation
+        # ON Organisation.Organisation_ID = t.Organisation_ID
+        # WHERE t.rownum = 1
+        # """
     
     def patients_date_deregistered_from_all_supported_practices(self, between):
         if between is None:
@@ -1442,7 +1556,7 @@ class GraphnetBackend:
             returning="binary_flag",
     ):
         date_condition, date_joins = self.get_date_condition(
-                "ONS_Deaths", "dod", between
+                "SharedCare.[Patient_Link]", "PL.[DeathDate]", between
         )
         if codelist is not None:
             assert codelist.system == "icd10"
@@ -1468,15 +1582,26 @@ class GraphnetBackend:
             column_definition = "MIN(icd10u)"
         else:
             raise ValueError(f"Unsupported `returning` value: {returning}")
+        # 26/05/2021 GPH-2805 Graphnet variant of SQL
         return f"""
         SELECT
-          ONS_Deaths.Patient_ID as patient_id,
+          PL.[PK_Patient_Link_ID] as patient_id,
           {column_definition} AS {returning}
-        FROM ONS_Deaths
+        FROM SharedCare.[Patient_Link] PL WITH (NOLOCK) 
         {date_joins}
         WHERE ({code_conditions}) AND {date_condition}
-        GROUP BY ONS_Deaths.Patient_ID
+        AND PL.[Deleted] = 'N'
+        GROUP BY PL.[PK_Patient_Link_ID]
         """
+        # return f"""
+        # SELECT
+        #   ONS_Deaths.Patient_ID as patient_id,
+        #   {column_definition} AS {returning}
+        # FROM ONS_Deaths
+        # {date_joins}
+        # WHERE ({code_conditions}) AND {date_condition}
+        # GROUP BY ONS_Deaths.Patient_ID
+        # """
     
     def patients_died_from_any_cause(
             self,
