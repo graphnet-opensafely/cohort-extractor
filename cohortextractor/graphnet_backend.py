@@ -848,7 +848,7 @@ class GraphnetBackend:
         SELECT DISTINCT PL.[PK_Patient_Link_ID] AS patient_id, 1 AS value
         FROM SharedCare.[Patient_Link] PL WITH (NOLOCK)
         {date_joins}
-        WHERE ISNULL(PL.[DateOfRegistration],PL.[CreateDate]) BETWEEN {start_date_sql} AND {end_date_sql}
+        WHERE CAST(ISNULL(PL.[DateOfRegistration],PL.[CreateDate]) AS DATE) BETWEEN {start_date_sql} AND {end_date_sql}
         AND PL.[Deleted] = 'N'
         AND ISNULL(PL.[DeathDate],'29991231') > {end_date_sql}
         {extra_condition}
@@ -973,7 +973,7 @@ class GraphnetBackend:
                 codelist, codes_are_case_sensitive
         )
         date_condition, date_joins = self.get_date_condition(
-                from_table, "[ActivityDate]", between
+                from_table, "CAST([ActivityDate] AS DATE)", between
         )
         ignored_day_condition, extra_queries = self._these_codes_occur_on_same_day(
                 from_table, ignore_days_where_these_codes_occur, between
@@ -1175,7 +1175,7 @@ class GraphnetBackend:
                 codelist, case_sensitive=True
         )
         date_condition, date_joins = self.get_date_condition(
-                from_table, "[ActivityDate]", between
+                from_table, "CAST([ActivityDate] AS DATE)", between
         )
         ignored_day_condition, extra_queries = self._these_codes_occur_on_same_day(
                 from_table, ignore_days_where_these_codes_occur, between
