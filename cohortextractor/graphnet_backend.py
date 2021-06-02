@@ -14,7 +14,7 @@ Documentation of all functions:
 https://docs.opensafely.org/study-def-variables/#cohortextractor.patients.with_these_clinical_events
 
 """
-
+import os
 import datetime
 import enum
 import hashlib
@@ -447,13 +447,15 @@ class GraphnetBackend:
         )
     
     def execute_queries(self, queries):
-        print()
-        print("-" * 50, "execute_queries", "-" * 50)
-        for sql in queries:
-            print("\t", sql)
+        debug = os.environ.get('DEBUG', default=None)
+        if debug:
             print()
-        print("-" * 50, "end execute_queries", "-" * 50)
-        print()
+            print("-" * 50, "execute_queries", "-" * 50)
+            for sql in queries:
+                print("\t", sql)
+                print()
+            print("-" * 50, "end execute_queries", "-" * 50)
+            print()
         
         cursor = self.get_db_connection().cursor()
         for query in queries:
