@@ -848,7 +848,7 @@ class GraphnetBackend:
         SELECT DISTINCT PL.[PK_Patient_Link_ID] AS patient_id, 1 AS value
         FROM SharedCare.[Patient_Link] PL WITH (NOLOCK)
         {date_joins}
-        WHERE CAST(ISNULL(PL.[DateOfRegistration],PL.[CreateDate]) AS DATE) BETWEEN {start_date_sql} AND {end_date_sql}
+        WHERE CAST(ISNULL(PL.[DateOfRegistration],PL.[CreateDate]) AS DATE) <= {end_date_sql}
         AND PL.[Deleted] = 'N'
         AND ISNULL(PL.[DeathDate],'29991231') > {end_date_sql}
         {extra_condition}
