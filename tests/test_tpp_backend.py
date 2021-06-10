@@ -27,6 +27,7 @@ from tests.tpp_backend_setup import (
     Appointment,
     CodedEvent,
     CodedEventSnomed,
+    DecisionSupportValue,
     EC_Diagnosis,
     HighCostDrugs,
     Household,
@@ -92,6 +93,7 @@ def setup_function(function):
     session.query(APCS).delete()
     session.query(OPA).delete()
     session.query(HighCostDrugs).delete()
+    session.query(DecisionSupportValue).delete()
     session.query(Patient).delete()
     session.commit()
 
@@ -2191,7 +2193,11 @@ def test_patients_with_test_result_in_sgss():
                     SGSS_Negative(Earliest_Specimen_Date="2020-07-10"),
                 ],
                 SGSS_AllTests_Positives=[
-                    SGSS_AllTests_Positive(Specimen_Date="2020-05-15"),
+                    SGSS_AllTests_Positive(
+                        Specimen_Date="2020-05-15",
+                        Variant="B.1.351",
+                        VariantDetectionMethod="Private Lab Sequencing",
+                    ),
                     SGSS_AllTests_Positive(Specimen_Date="2020-05-20"),
                 ],
                 SGSS_AllTests_Negatives=[
@@ -2212,7 +2218,11 @@ def test_patients_with_test_result_in_sgss():
                     SGSS_AllTests_Negative(Specimen_Date="2020-04-01")
                 ],
                 SGSS_AllTests_Positives=[
-                    SGSS_AllTests_Positive(Specimen_Date="2020-04-20"),
+                    SGSS_AllTests_Positive(
+                        Specimen_Date="2020-04-20",
+                        Variant="VOC-20DEC-01 detected",
+                        VariantDetectionMethod="Reflex Assay",
+                    ),
                     SGSS_AllTests_Positive(Specimen_Date="2020-05-02"),
                 ],
             ),
@@ -2275,6 +2285,20 @@ def test_patients_with_test_result_in_sgss():
             find_first_match_in_period=True,
             returning="s_gene_target_failure",
         ),
+        variant=patients.with_test_result_in_sgss(
+            pathogen="SARS-CoV-2",
+            test_result="positive",
+            find_first_match_in_period=True,
+            restrict_to_earliest_specimen_date=False,
+            returning="variant",
+        ),
+        variant_detection_method=patients.with_test_result_in_sgss(
+            pathogen="SARS-CoV-2",
+            test_result="positive",
+            find_first_match_in_period=True,
+            restrict_to_earliest_specimen_date=False,
+            returning="variant_detection_method",
+        ),
     )
     assert_results(
         study.to_dicts(),
@@ -2291,6 +2315,8 @@ def test_patients_with_test_result_in_sgss():
         first_negative_after_a_positive=["2020-07-10", "", "", ""],
         last_positive_test_date=["2020-05-20", "2020-05-02", "", ""],
         sgtf_result=["9", "1", "", ""],
+        variant=["B.1.351", "VOC-20DEC-01", "", ""],
+        variant_detection_method=["Private Lab Sequencing", "Reflex Assay", "", ""],
     )
 
 
@@ -2715,8 +2741,16 @@ def test_patients_date_deregistered_from_all_supported_practices():
             on_or_before="2018-02-01",
             date_format="YYYY-MM",
         ),
+        dereg_date_2=patients.date_deregistered_from_all_supported_practices(
+            on_or_after="2015-01-01",
+            date_format="YYYY-MM",
+        ),
     )
-    assert_results(study.to_dicts(), dereg_date=["", "", "2017-10"])
+    assert_results(
+        study.to_dicts(),
+        dereg_date=["", "", "2017-10"],
+        dereg_date_2=["", "2020-01", "2017-10"],
+    )
 
 
 def test_patients_admitted_to_hospital():
@@ -3395,3 +3429,223 @@ def test_ethnicity_from_sus():
         ethnicity_by_group_6=["2", "2"],
         ethnicity_by_group_16=["4", "7"],
     )
+
+
+def _make_patient_with_decision_support_values():
+    """Makes a patient with decision support values for the Electronic Frailty Index."""
+    session = make_session()
+    session.add_all(
+        [
+            Patient(
+                DecisionSupportValue=[
+                    DecisionSupportValue(
+                        AlgorithmType=1,  # Set by TPP
+                        CalculationDateTime="2020-01-01 00:00:00.000",
+                        NumericValue=0.1,
+                    ),
+                    DecisionSupportValue(
+                        AlgorithmType=1,
+                        CalculationDateTime="2020-07-01 00:00:00.000",
+                        NumericValue=0.2,
+                    ),
+                    DecisionSupportValue(
+                        AlgorithmType=1,
+                        CalculationDateTime="2021-01-01 00:00:00.000",
+                        NumericValue=0.3,
+                    ),
+                ]
+            ),
+        ]
+    )
+    session.commit()
+
+
+def test_decision_support_values_with_unsupported_algorithm_value():
+    _make_patient_with_decision_support_values()
+    with pytest.raises(ValueError) as exinfo:
+        StudyDefinition(
+            population=patients.all(),
+            efi=patients.with_these_decision_support_values(
+                "eFI",
+            ),
+        )
+
+    assert str(exinfo.value) == "Unsupported `algorithm` value: eFI"
+
+
+@pytest.mark.parametrize(
+    "returning,expected",
+    [
+        ("binary_flag", ["1"]),
+        ("date", ["2021"]),
+        ("number_of_matches_in_period", ["3"]),
+        ("numeric_value", ["0.3"]),
+    ],
+)
+def test_decision_support_values_with_max_date(returning, expected):
+    _make_patient_with_decision_support_values()
+    study = StudyDefinition(
+        population=patients.all(),
+        efi=patients.with_these_decision_support_values(
+            "electronic_frailty_index",
+            on_or_before="2021-01-01",
+            returning=returning,
+        ),
+    )
+    assert_results(study.to_dicts(), efi=expected)
+
+
+@pytest.mark.parametrize(
+    "returning,expected",
+    [
+        ("binary_flag", ["1"]),
+        ("date", ["2021"]),
+        ("number_of_matches_in_period", ["1"]),
+        ("numeric_value", ["0.3"]),
+    ],
+)
+def test_decision_support_values_with_min_date(returning, expected):
+    _make_patient_with_decision_support_values()
+    study = StudyDefinition(
+        population=patients.all(),
+        efi=patients.with_these_decision_support_values(
+            "electronic_frailty_index",
+            on_or_after="2021-01-01",
+            returning=returning,
+        ),
+    )
+    assert_results(study.to_dicts(), efi=expected)
+
+
+@pytest.mark.parametrize(
+    "returning,expected",
+    [
+        ("binary_flag", ["1"]),
+        ("date", ["2020"]),
+        ("number_of_matches_in_period", ["2"]),
+        ("numeric_value", ["0.2"]),
+    ],
+)
+def test_decision_support_values_with_max_and_min_date(returning, expected):
+    _make_patient_with_decision_support_values()
+    study = StudyDefinition(
+        population=patients.all(),
+        efi=patients.with_these_decision_support_values(
+            "electronic_frailty_index",
+            between=["2020-01-01", "2020-12-31"],
+            returning=returning,
+        ),
+    )
+    assert_results(study.to_dicts(), efi=expected)
+
+
+@pytest.mark.parametrize(
+    "returning,expected",
+    [
+        ("binary_flag", ["1"]),
+        ("date", ["2020"]),
+        ("number_of_matches_in_period", ["3"]),
+        ("numeric_value", ["0.1"]),
+    ],
+)
+def test_decision_support_values_with_first_match(returning, expected):
+    _make_patient_with_decision_support_values()
+    study = StudyDefinition(
+        population=patients.all(),
+        efi=patients.with_these_decision_support_values(
+            "electronic_frailty_index",
+            find_first_match_in_period=True,
+            returning=returning,
+        ),
+    )
+    assert_results(study.to_dicts(), efi=expected)
+
+
+@pytest.mark.parametrize(
+    "returning,expected",
+    [
+        ("binary_flag", ["1"]),
+        ("date", ["2021"]),
+        ("number_of_matches_in_period", ["3"]),
+        ("numeric_value", ["0.3"]),
+    ],
+)
+def test_decision_support_values_with_last_match(returning, expected):
+    _make_patient_with_decision_support_values()
+    study = StudyDefinition(
+        population=patients.all(),
+        efi=patients.with_these_decision_support_values(
+            "electronic_frailty_index",
+            find_last_match_in_period=True,
+            returning=returning,
+        ),
+    )
+    assert_results(study.to_dicts(), efi=expected)
+
+
+def test_decision_support_values_with_first_match_and_last_match():
+    _make_patient_with_decision_support_values()
+    with pytest.raises(AssertionError):
+        StudyDefinition(
+            population=patients.all(),
+            efi=patients.with_these_decision_support_values(
+                "electronic_frailty_index",
+                find_first_match_in_period=True,
+                find_last_match_in_period=True,
+            ),
+        )
+
+
+def test_decision_support_values_with_unsupported_returning_value():
+    _make_patient_with_decision_support_values()
+    with pytest.raises(ValueError) as exinfo:
+        StudyDefinition(
+            population=patients.all(),
+            efi=patients.with_these_decision_support_values(
+                "electronic_frailty_index",
+                returning="code",
+            ),
+        )
+
+    assert str(exinfo.value) == "Unsupported `returning` value: code"
+
+
+@pytest.mark.parametrize(
+    "returning,expected",
+    [
+        ("binary_flag", ["1"]),
+        ("date", ["2021"]),
+        ("number_of_matches_in_period", ["1"]),
+        ("numeric_value", ["0.1"]),
+    ],
+)
+def test_decision_support_values_with_ignore_missing_values(returning, expected):
+    session = make_session()
+    session.add_all(
+        [
+            Patient(
+                DecisionSupportValue=[
+                    DecisionSupportValue(
+                        AlgorithmType=1,
+                        CalculationDateTime="2020-01-01 00:00:00.000",
+                        NumericValue=0.0,  # Ignore me!
+                    ),
+                    DecisionSupportValue(
+                        AlgorithmType=1,
+                        CalculationDateTime="2021-01-01 00:00:00.000",
+                        NumericValue=0.1,
+                    ),
+                ]
+            ),
+        ]
+    )
+    session.commit()
+    study = StudyDefinition(
+        population=patients.all(),
+        efi=patients.with_these_decision_support_values(
+            "electronic_frailty_index",
+            returning=returning,
+            ignore_missing_values=True,
+        ),
+    )
+    assert_results(study.to_dicts(), efi=expected)

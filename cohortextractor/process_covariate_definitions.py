@@ -319,6 +319,9 @@ class GetColumnType:
     def type_of_with_ethnicity_from_sus(self, returning, **kwargs):
         return self._type_from_return_value(returning)
 
+    def type_of_with_these_decision_support_values(self, returning, **kwargs):
+        return self._type_from_return_value(returning)
+
     def _type_from_return_value(self, returning):
         if returning == "nhse_region_name":
             raise ValueError(
@@ -366,6 +369,8 @@ class GetColumnType:
             "days_in_critical_care": "str",
             "administrative_category": "str",
             "duration_of_elective_wait": "str",
+            "variant": "str",
+            "variant_detection_method": "str",
         }
         try:
             return mapping[returning]

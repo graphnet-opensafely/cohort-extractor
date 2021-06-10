@@ -1019,6 +1019,102 @@ class TPPBackend:
 
         return codelist_queries + extra_queries + [sql]
 
+    def patients_with_these_decision_support_values(
+        self,
+        algorithm,
+        between,
+        find_first_match_in_period,
+        find_last_match_in_period,
+        returning,
+        ignore_missing_values,
+    ):
+        # First, we resolve the algorithm.
+        algorithm_to_id = {  # Map the value we use to the ID TPP use
+            "electronic_frailty_index": 1,
+        }
+        try:
+            algorithm_type_id = algorithm_to_id[algorithm]
+        except KeyError:
+            raise ValueError(f"Unsupported `algorithm` value: {algorithm}")
+
+        # Then, we resolve the date limits.
+        date_condition, date_joins = self.get_date_condition(
+            "DecisionSupportValue", "CalculationDateTime", between
+        )
+
+        # Then, we resolve the matching rule.
+        # "It will never happen" happens, but not often enough to raise a `ValueError`.
+        assert not (find_first_match_in_period and find_last_match_in_period)
+        if find_first_match_in_period:
+            ordering = "ASC"
+            date_aggregate = "MIN"
+        else:
+            ordering = "DESC"
+            date_aggregate = "MAX"
+
+        # Then, we resolve the return type.
+        value_column_alias = returning
+        if returning == "binary_flag" or returning == "date":
+            use_partition_query = False
+            value_column_expression = 1  # The literal value `1`
+            value_column_alias = "binary_flag"
+        elif returning == "number_of_matches_in_period":
+            use_partition_query = False
+            value_column_expression = "COUNT(*)"
+        elif returning == "numeric_value":
+            use_partition_query = True
+            value_column_expression = "NumericValue"
+        else:
+            raise ValueError(f"Unsupported `returning` value: {returning}")
+
+        # Then, we resolve the missing values rule.
+        missing_values_condition = (
+            "NumericValue != 0" if ignore_missing_values else "1 = 1"
+        )
+
+        # Finally, we construct the query.
+        if use_partition_query:
+            sql = f"""
+                SELECT
+                    Patient_ID AS patient_id,
+                    {value_column_expression} AS {value_column_alias},
+                    CalculationDateTime AS date
+                FROM (
+                    SELECT
+                        Patient_ID,
+                        {value_column_expression},
+                        CalculationDateTime,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY Patient_ID
+                            ORDER BY CalculationDateTime {ordering}, Patient_ID
+                        ) AS rownum
+                    FROM
+                        DecisionSupportValue
+                    WHERE
+                        AlgorithmType = {quote(algorithm_type_id)}
+                        AND {date_condition}
+                        AND {missing_values_condition}
+                ) t
+                WHERE
+                    rownum = 1
+            """
+        else:
+            sql = f"""
+                SELECT
+                    Patient_ID AS patient_id,
+                    {value_column_expression} AS {value_column_alias},
+                    {date_aggregate}(CalculationDateTime) AS date
+                FROM
+                    DecisionSupportValue
+                WHERE
+                    AlgorithmType = {quote(algorithm_type_id)}
+                    AND {date_condition}
+                    AND {missing_values_condition}
+                GROUP BY
+                    Patient_ID
+            """
+        return [sql]
+
     def _number_of_episodes_by_medication(
         self,
         codelist,
@@ -1158,7 +1254,6 @@ class TPPBackend:
         """
         if codelist is None:
             return "0 = 1", []
-        assert codelist.system == "ctv3"
         codelist_table, queries = self.create_codelist_table(
             codelist, case_sensitive=True
         )
@@ -1240,7 +1335,9 @@ class TPPBackend:
             max_date = "3000-01-01"
         if min_date is None:
             min_date = "1900-01-01"
-        date_condition, date_joins = self.get_date_condition("t", "t.end_date", between)
+        date_condition, date_joins = self.get_date_condition(
+            "t", "t.end_date", (min_date, max_date)
+        )
         return f"""
         SELECT
           t.Patient_id,
@@ -1692,6 +1789,17 @@ class TPPBackend:
                 "  test_result = 'positive'"
             )
 
+        if (
+            returning in ("variant", "variant_detection_method")
+            and restrict_to_earliest_specimen_date
+        ):
+            raise ValueError(
+                f"Due to limitations in the SGSS data we receive you can only use:\n"
+                f"  returning = '{returning}'\n"
+                f"with the option:\n"
+                f"  restrict_to_earliest_specimen_date = False\n"
+            )
+
         if returning == "binary_flag":
             column = "1"
         elif returning == "date":
@@ -1705,6 +1813,23 @@ class TPPBackend:
             column = "t2.sgtf"
         elif returning == "case_category":
             column = "t2.case_cateogory"
+        elif returning == "variant":
+            raw_column = "t2.variant"
+            transforms = {
+                "(blank)": "",
+                "none": "",
+                "N/A": "",
+                "VOC-20DEC-01 detected": "VOC-20DEC-01",
+            }
+            case_clauses = "\n".join(
+                [
+                    f"WHEN {raw_column} = {quote(key)} THEN {quote(value)}"
+                    for (key, value) in transforms.items()
+                ]
+            )
+            column = f"CASE {case_clauses} ELSE {raw_column} END"
+        elif returning == "variant_detection_method":
+            column = "t2.variant_detection_method"
         else:
             raise ValueError(f"Unsupported `returning` value: {returning}")
 
@@ -1729,13 +1854,17 @@ class TPPBackend:
             positive_query = """
             SELECT
               Patient_ID AS patient_id,
-              Specimen_Date AS date
+              Specimen_Date AS date,
+              Variant AS variant,
+              VariantDetectionMethod AS variant_detection_method
             FROM SGSS_AllTests_Positive
             """
             negative_query = """
             SELECT
               Patient_ID AS patient_id,
-              Specimen_Date AS date
+              Specimen_Date AS date,
+              '' AS variant,
+              '' AS variant_detection_method
             FROM SGSS_AllTests_Negative
             """
 

@@ -386,8 +386,9 @@ class EMISBackend:
         final_query = queries.pop()
         run_analyze = bool(os.environ.get("RUN_ANALYZE"))
         for sql in queries:
-            cursor.execute(sql)
             table_name = re.search(r"CREATE TABLE IF NOT EXISTS (\w+)", sql).groups()[0]
+            logger.info(f"Running query for {table_name}")
+            cursor.execute(sql)
             if run_analyze:
                 cursor.execute(f"ANALYZE {table_name}")
 
@@ -1434,9 +1435,7 @@ class EMISBackend:
             {date_joins}
             WHERE ({code_conditions})
                 AND {date_condition}
-                AND date_parse(o.upload_date, '%d/%m/%Y') = (
-                    SELECT MAX(date_parse(upload_date, '%d/%m/%Y')) FROM {ONS_TABLE}
-                )
+                AND o.upload_date = (SELECT MAX(upload_date) FROM {ONS_TABLE})
             """
 
     def patients_died_from_any_cause(
