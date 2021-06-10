@@ -445,9 +445,9 @@ class GraphnetBackend:
                 # date_format from that
                 date_format=other_columns[column_names[0]].date_format,
         )
-    
+
     def execute_queries(self, queries):
-        debug = os.environ.get('DEBUG_LOG_SQL', default=False)
+        debug = os.environ.get('DEBUG_LOG_SQL', default=0) == 1
         if debug:
             print()
             print("-" * 50, "execute_queries", "-" * 50)
@@ -456,7 +456,7 @@ class GraphnetBackend:
                 print()
             print("-" * 50, "end execute_queries", "-" * 50)
             print()
-        
+    
         cursor = self.get_db_connection().cursor()
         for query in queries:
             comment_match = re.match(r"^\s*\-\-\s*(.+)\n", query)
