@@ -20,9 +20,12 @@ services:
     depends_on:
       - mssql
   app:
-    build: .
+    image: cohortextractor-dev
+    build: 
+      context: .
+      target: cohortextractor-dev
     volumes:
-      - .:/home/app/notebook
+      - .:/app
     depends_on:
       - mssql
       - trino

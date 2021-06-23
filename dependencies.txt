@@ -1,0 +1,16 @@
+# run time dependencies
+# ensure fully working base python3 installation
+# see: https://gist.github.com/tiran/2dec9e03c6f901814f6d1e8dad09528e
+python3
+python3-venv
+python3-pip
+python3-distutils
+tzdata
+ca-certificates
+# cohortextractor dependencies
+default-jre-headless
+# from packages.microsoft.com
+msodbcsql17
+mssql-tools
+
+

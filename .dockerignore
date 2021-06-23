@@ -1,1 +1,12 @@
 .git
+Dockerfile
+docker-compose.yml
+venv
+mssql
+presto
+certs
+*.md
+LICENSE
+MANIFEST.in
+run.sh
+sqljdbc_9.2
