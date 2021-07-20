@@ -447,7 +447,7 @@ class GraphnetBackend:
         )
 
     def execute_queries(self, queries):
-        debug = os.environ.get('DEBUG_LOG_SQL', default=0) == 1
+        debug = os.environ.get('DEBUG_LOG_SQL', default="0") == "1"
         if debug:
             print()
             print("-" * 50, "execute_queries", "-" * 50)
