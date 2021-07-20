@@ -62,16 +62,16 @@ def mssql_dbapi_connection_from_url(url):
 
 
 def _pyodbc_connect(pyodbc, params):
-    applicationIntentReadOnly = os.environ.get('ApplicationIntentReadOnly', default="0") == "1"
+    applicationIntentReadOnly = os.environ.get('APPLICATION_INTENT_READ_ONLY', default="0") == "1"
     print("ApplicationIntent=ReadyOnly", applicationIntentReadOnly)
+    extra = ";ApplicationIntent=ReadOnly" if applicationIntentReadOnly else ""
     connection_str_template = (
         "DRIVER={{ODBC Driver 17 for SQL Server}};"
         "SERVER={host},{port};"
         "DATABASE={database};"
         "UID={username};"
         "PWD={password}"
-        ";ApplicationIntent=ReadOnly" if applicationIntentReadOnly else ""
-    )
+    ) + extra
     connection_str = connection_str_template.format(**params)
     return pyodbc.connect(connection_str)
 
