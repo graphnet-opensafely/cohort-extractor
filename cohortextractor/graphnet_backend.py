@@ -846,9 +846,15 @@ class GraphnetBackend:
             extra_condition = f"  AND Organisation.GoLiveDate <= {start_date_sql}"
 
         # 26/05/2021 GPH-2805 Graphnet variant of SQL
+        # 28/07/2021 GPH-3568 Added joins to Patient to limit to resident population
         return f"""
         SELECT DISTINCT PL.[PK_Patient_Link_ID] AS patient_id, 1 AS value
         FROM SharedCare.[Patient_Link] PL WITH (NOLOCK)
+        INNER JOIN SharedCare.[Patient] P WITH (NOLOCK) 
+            ON PL.[PK_Patient_Link_ID] = P.[FK_Patient_Link_ID]
+            AND P.[Deleted] = 'N'
+            AND P.[FK_Reference_Tenancy_ID] = 2
+            AND ISNULL(P.[GPPracticeCode],'') != ''
         {date_joins}
         WHERE CAST(ISNULL(PL.[DateOfRegistration],PL.[CreateDate]) AS DATE) <= {end_date_sql}
         AND PL.[Deleted] = 'N'
