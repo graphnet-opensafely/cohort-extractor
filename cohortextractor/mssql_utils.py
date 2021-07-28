@@ -33,6 +33,7 @@ def mssql_dbapi_connection_from_url(url):
     # database driver installed (which complicates local installing).
     params = mssql_connection_params_from_url(url)
 
+    # ctds is not supported in Graphnet backend
     # # For more background on why we use cTDS and why we support multiple
     # # database drivers see:
     # # https://github.com/opensafely/cohort-extractor/pull/286
@@ -62,19 +63,16 @@ def mssql_dbapi_connection_from_url(url):
 
 
 def _pyodbc_connect(pyodbc, params):
-    applicationIntentReadOnly = os.environ.get('APPLICATION_INTENT_READ_ONLY', default="0") == "1"
-    print("ApplicationIntent=ReadyOnly", applicationIntentReadOnly)
-    extra = ";ApplicationIntent=ReadOnly" if applicationIntentReadOnly else ""
     connection_str_template = (
         "DRIVER={{ODBC Driver 17 for SQL Server}};"
         "SERVER={host},{port};"
         "DATABASE={database};"
         "UID={username};"
-        "PWD={password}"
-    ) + extra
+        "PWD={password};"
+        "ApplicationIntent=ReadOnly"
+    )
     connection_str = connection_str_template.format(**params)
     return pyodbc.connect(connection_str)
-
 
 def _ctds_connect(ctds, params):
     params = params.copy()
