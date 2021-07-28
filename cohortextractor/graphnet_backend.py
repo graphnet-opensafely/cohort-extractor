@@ -976,6 +976,8 @@ class GraphnetBackend:
     ):
         # 26/05/2021 GPH-2805 Can just hardcode these
         from_table = "SharedCare.[Normalised_Coding]"
+        # 28/07/2021 GPH-3568 Want to separate the table name from the alias
+        from_table_alias = "NC"
         code_column = "[SnomedConceptID]"
         codelist_table, codelist_queries = self.create_codelist_table(
                 codelist, codes_are_case_sensitive
@@ -1041,7 +1043,9 @@ class GraphnetBackend:
                 PARTITION BY NC.[FK_Patient_Link_ID]
                 ORDER BY NC.[ActivityDate] {ordering}, {from_table_id_col}
               ) AS rownum
-              FROM {from_table} NC WITH (NOLOCK) {additional_join}
+              FROM {from_table} NC WITH (NOLOCK)
+                INNER JOIN #registered reg WITH (NOLOCK) ON NC.[FK_Patient_Link_ID] = reg.[patient_id]
+                {additional_join}
               INNER JOIN {codelist_table}
               ON NC.{code_column} COLLATE Latin1_General_CS_AS = {codelist_table}.code COLLATE Latin1_General_CS_AS
               {date_joins}
@@ -1054,17 +1058,19 @@ class GraphnetBackend:
         else:
             sql = f"""
             SELECT
-              {from_table}.[FK_Patient_Link_ID] AS patient_id,
+              {from_table_alias}.[FK_Patient_Link_ID] AS patient_id,
               {column_definition} AS {column_name},
               {date_aggregate}([ActivityDate]) AS date
-            FROM {from_table}{additional_join}
+            FROM {from_table} NC WITH (NOLOCK)
+                INNER JOIN #registered reg WITH (NOLOCK) ON NC.[FK_Patient_Link_ID] = reg.[patient_id]
+                {additional_join}
             INNER JOIN {codelist_table}
             ON {code_column} COLLATE Latin1_General_BIN = {codelist_table}.code COLLATE Latin1_General_BIN
             {date_joins}
             WHERE {date_condition}
               AND NOT {ignored_day_condition}
               AND {missing_value_condition}
-            GROUP BY {from_table}.[FK_Patient_Link_ID]
+            GROUP BY {from_table_alias}.[FK_Patient_Link_ID]
             """
         #
         #     sql = f"""
@@ -1347,6 +1353,7 @@ class GraphnetBackend:
             ORDER BY GPH.[StartDate] DESC
           ) AS rownum
           FROM SharedCare.[Patient_GP_History] GPH WITH (NOLOCK) 
+        INNER JOIN #registered reg WITH (NOLOCK) ON GPH.[FK_Patient_Link_ID] = reg.[patient_id]
           {date_joins}
           WHERE GPH.[StartDate] <= {date_sql} AND ISNULL(GPH.[EndDate],'29991231') > {date_sql}
           AND GPH.[Deleted] = 'N'
@@ -1596,6 +1603,7 @@ class GraphnetBackend:
           PL.[PK_Patient_Link_ID] as patient_id,
           {column_definition} AS {returning}
         FROM SharedCare.[Patient_Link] PL WITH (NOLOCK) 
+        INNER JOIN #registered reg WITH (NOLOCK) ON PL.[PK_Patient_Link_ID] = reg.[patient_id]
         {date_joins}
         WHERE ({code_conditions}) AND {date_condition}
         AND PL.[Deleted] = 'N'
