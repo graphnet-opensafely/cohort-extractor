@@ -1044,8 +1044,12 @@ class GraphnetBackend:
                 ORDER BY NC.[ActivityDate] {ordering}, {from_table_id_col}
               ) AS rownum
               FROM {from_table} NC WITH (NOLOCK)
-                INNER JOIN #registered reg WITH (NOLOCK) ON NC.[FK_Patient_Link_ID] = reg.[patient_id]
-                {additional_join}
+            INNER JOIN SharedCare.[Patient] P WITH (NOLOCK)
+                ON NC.[FK_Patient_Link_ID] = P.[FK_Patient_Link_ID]
+                AND P.[Deleted] = 'N'
+                AND P.[FK_Reference_Tenancy_ID] = 2
+                AND ISNULL(P.[GPPracticeCode],'') != ''
+            {additional_join}
               INNER JOIN {codelist_table}
               ON NC.{code_column} COLLATE Latin1_General_CS_AS = {codelist_table}.code COLLATE Latin1_General_CS_AS
               {date_joins}
@@ -1062,8 +1066,12 @@ class GraphnetBackend:
               {column_definition} AS {column_name},
               {date_aggregate}([ActivityDate]) AS date
             FROM {from_table} NC WITH (NOLOCK)
-                INNER JOIN #registered reg WITH (NOLOCK) ON NC.[FK_Patient_Link_ID] = reg.[patient_id]
-                {additional_join}
+            INNER JOIN SharedCare.[Patient] P WITH (NOLOCK)
+                ON NC.[FK_Patient_Link_ID] = P.[FK_Patient_Link_ID]
+                AND P.[Deleted] = 'N'
+                AND P.[FK_Reference_Tenancy_ID] = 2
+                AND ISNULL(P.[GPPracticeCode],'') != ''
+            {additional_join}
             INNER JOIN {codelist_table}
             ON {code_column} COLLATE Latin1_General_BIN = {codelist_table}.code COLLATE Latin1_General_BIN
             {date_joins}
@@ -1353,7 +1361,12 @@ class GraphnetBackend:
             ORDER BY GPH.[StartDate] DESC
           ) AS rownum
           FROM SharedCare.[Patient_GP_History] GPH WITH (NOLOCK) 
-        INNER JOIN #registered reg WITH (NOLOCK) ON GPH.[FK_Patient_Link_ID] = reg.[patient_id]
+        
+        INNER JOIN SharedCare.[Patient] P WITH (NOLOCK)
+            ON GPH.[FK_Patient_Link_ID] = P.[FK_Patient_Link_ID]
+            AND P.[Deleted] = 'N'
+            AND P.[FK_Reference_Tenancy_ID] = 2
+            AND ISNULL(P.[GPPracticeCode],'') != ''
           {date_joins}
           WHERE GPH.[StartDate] <= {date_sql} AND ISNULL(GPH.[EndDate],'29991231') > {date_sql}
           AND GPH.[Deleted] = 'N'
@@ -1602,8 +1615,12 @@ class GraphnetBackend:
         SELECT
           PL.[PK_Patient_Link_ID] as patient_id,
           {column_definition} AS {returning}
-        FROM SharedCare.[Patient_Link] PL WITH (NOLOCK) 
-        INNER JOIN #registered reg WITH (NOLOCK) ON PL.[PK_Patient_Link_ID] = reg.[patient_id]
+        FROM SharedCare.[Patient_Link] PL WITH (NOLOCK)
+        INNER JOIN SharedCare.[Patient] P WITH (NOLOCK)
+            ON PL.[PK_Patient_Link_ID] = P.[FK_Patient_Link_ID]
+            AND P.[Deleted] = 'N'
+            AND P.[FK_Reference_Tenancy_ID] = 2
+            AND ISNULL(P.[GPPracticeCode],'') != ''
         {date_joins}
         WHERE ({code_conditions}) AND {date_condition}
         AND PL.[Deleted] = 'N'
