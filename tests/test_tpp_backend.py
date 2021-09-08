@@ -1131,6 +1131,54 @@ def test_patients_registered_practice_as_of():
     )
 
 
+def test_patients_registered_practice_as_of_returning_rct():
+    session = make_session()
+    org = Organisation()
+    patient = Patient()
+    patient.RegistrationHistory.append(
+        RegistrationHistory(
+            StartDate="2019-01-01",
+            EndDate="2021-01-01",
+            Organisation=org,
+        )
+    )
+    # The organisation is participating in two RCTs.
+    crt_reference_1 = ClusterRandomisedTrialReference(
+        TrialName="germdefence",
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org,
+            Property="code",
+            PropertyValue="code_value",  # FIXME
+        )
+    )
+    crt_reference_2 = ClusterRandomisedTrialReference(
+        TrialName="coffeeintervention",
+    )
+    crt_reference_2.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org,
+            Property="blend",
+            PropertyValue="arabica",
+        )
+    )
+    session.add_all([org, patient, crt_reference_1, crt_reference_2])
+    session.commit()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        is_germdefence_rct=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__code"
+        ),
+    )
+
+    assert_results(
+        study.to_dicts(),
+        is_germdefence_rct=["code_value"],
+    )
+
+
 def test_patients_address_as_of():
     session = make_session()
     session.add_all(

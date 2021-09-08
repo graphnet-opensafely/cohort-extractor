@@ -380,6 +380,7 @@ class GetColumnType:
             "underlying_cause_of_death": "str",
             "variant": "str",
             "variant_detection_method": "str",
+            "rct__germdefence__code": "str",
         }
         try:
             return mapping[returning]
