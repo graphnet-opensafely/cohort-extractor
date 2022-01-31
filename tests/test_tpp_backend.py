@@ -11,6 +11,11 @@ import pytest
 from cohortextractor import StudyDefinition, codelist, patients
 from cohortextractor.date_expressions import InvalidExpressionError
 from cohortextractor.mssql_utils import mssql_connection_params_from_url
+from cohortextractor.patients import (
+    max_recorded_value,
+    mean_recorded_value,
+    min_recorded_value,
+)
 from cohortextractor.tpp_backend import (
     AppointmentStatus,
     escape_like_query_fragment,
@@ -25,16 +30,22 @@ from tests.tpp_backend_setup import (
     OPA,
     APCS_Der,
     Appointment,
+    ClusterRandomisedTrial,
+    ClusterRandomisedTrialDetail,
+    ClusterRandomisedTrialReference,
     CodedEvent,
+    CodedEventRange,
     CodedEventSnomed,
     DecisionSupportValue,
     EC_Diagnosis,
+    HealthCareWorker,
     HighCostDrugs,
     Household,
     HouseholdMember,
     MedicationDictionary,
     MedicationIssue,
     ONSDeaths,
+    OPA_Proc,
     Organisation,
     Patient,
     PatientAddress,
@@ -46,6 +57,7 @@ from tests.tpp_backend_setup import (
     SGSS_Positive,
     Vaccination,
     VaccinationReference,
+    clear_database,
     make_database,
     make_session,
 )
@@ -64,9 +76,14 @@ def setup_module(module):
     make_database()
 
 
+def teardown_module(module):
+    clear_database()
+
+
 def setup_function(function):
     """Ensure test database is empty"""
     session = make_session()
+    session.query(CodedEventRange).delete()
     session.query(CodedEvent).delete()
     session.query(CodedEventSnomed).delete()
     session.query(ICNARC).delete()
@@ -82,6 +99,9 @@ def setup_function(function):
     session.query(MedicationIssue).delete()
     session.query(MedicationDictionary).delete()
     session.query(RegistrationHistory).delete()
+    session.query(ClusterRandomisedTrial).delete()
+    session.query(ClusterRandomisedTrialDetail).delete()
+    session.query(ClusterRandomisedTrialReference).delete()
     session.query(Organisation).delete()
     session.query(PotentialCareHomeAddress).delete()
     session.query(PatientAddress).delete()
@@ -91,9 +111,11 @@ def setup_function(function):
     session.query(EC).delete()
     session.query(APCS_Der).delete()
     session.query(APCS).delete()
+    session.query(OPA_Proc).delete()
     session.query(OPA).delete()
     session.query(HighCostDrugs).delete()
     session.query(DecisionSupportValue).delete()
+    session.query(HealthCareWorker).delete()
     session.query(Patient).delete()
     session.commit()
 
@@ -146,7 +168,7 @@ def test_correct_driver_used():
     # running against the same driver we use in production
     study = StudyDefinition(population=patients.all())
     module = study.backend.get_db_connection().__class__.__module__
-    assert module == "ctds"
+    assert module.startswith("pymssql")
 
 
 def test_meds():
@@ -856,11 +878,23 @@ def test_bmi_when_only_some_measurements_of_child():
     assert [x["BMI_date_measured"] for x in results] == ["2010-01-01"]
 
 
-def test_mean_recorded_value():
+@pytest.mark.parametrize(
+    "summary_function,expected",
+    [
+        (mean_recorded_value, [("96.0", "2020-02-10"), ("0.0", ""), ("0.0", "")]),
+        (min_recorded_value, [("90.0", "2020-02-10"), ("0.0", ""), ("0.0", "")]),
+        (max_recorded_value, [("100.0", "2020-02-10"), ("0.0", ""), ("0.0", "")]),
+    ],
+)
+def test_summary_recorded_values_on_most_recent_day(summary_function, expected):
     code = "2469."
     session = make_session()
     patient = Patient()
     values = [
+        # These days are within the period but not the most recent, and should be ignored
+        ("2020-01-01", 110),
+        ("2020-01-02", 80),
+        # This is the most recent day; mean taken from these 3 measurements
         ("2020-02-10", 90),
         ("2020-02-10", 100),
         ("2020-02-10", 98),
@@ -880,7 +914,7 @@ def test_mean_recorded_value():
     session.commit()
     study = StudyDefinition(
         population=patients.all(),
-        bp_systolic=patients.mean_recorded_value(
+        bp_systolic=summary_function(
             codelist([code], system="ctv3"),
             on_most_recent_day_of_measurement=True,
             between=["2018-01-01", "2020-03-01"],
@@ -891,7 +925,67 @@ def test_mean_recorded_value():
     )
     results = study.to_dicts()
     results = [(i["bp_systolic"], i["bp_systolic_date_measured"]) for i in results]
-    assert results == [("96.0", "2020-02-10"), ("0.0", ""), ("0.0", "")]
+    assert results == expected
+
+
+@pytest.mark.parametrize(
+    "summary_function,expected",
+    [
+        (mean_recorded_value, ["95.6", "0.0", "0.0"]),
+        (min_recorded_value, ["80.0", "0.0", "0.0"]),
+        (max_recorded_value, ["110.0", "0.0", "0.0"]),
+    ],
+)
+def test_summary_recorded_values_across_date_range(summary_function, expected):
+    code = "44J3."
+    session = make_session()
+    patient = Patient()
+    values = [
+        # these 5 are within the period
+        ("2020-01-01", 110),
+        ("2020-01-02", 80),
+        ("2020-02-10", 90),
+        ("2020-02-10", 100),
+        ("2020-02-10", 98),
+        # This day is outside period and should be ignored
+        ("2020-04-01", 110),
+    ]
+    for date, value in values:
+        patient.CodedEvents.append(
+            CodedEvent(CTV3Code=code, NumericValue=value, ConsultationDate=date)
+        )
+    patient_with_old_reading = Patient()
+    patient_with_old_reading.CodedEvents.append(
+        CodedEvent(CTV3Code=code, NumericValue=100, ConsultationDate="2010-01-01")
+    )
+    patient_with_no_reading = Patient()
+    session.add_all([patient, patient_with_old_reading, patient_with_no_reading])
+    session.commit()
+    study = StudyDefinition(
+        population=patients.all(),
+        creatine=summary_function(
+            codelist([code], system="ctv3"),
+            on_most_recent_day_of_measurement=False,
+            between=["2018-01-01", "2020-03-01"],
+        ),
+    )
+    assert_results(study.to_dicts(), creatine=expected)
+
+
+def test_mean_recorded_value_across_date_range_include_measurement_date_error():
+    with pytest.raises(
+        AssertionError,
+        match="Can only include measurement date if on_most_recent_day_of_measurement is True",
+    ):
+        StudyDefinition(
+            population=patients.all(),
+            creatine=patients.mean_recorded_value(
+                codelist(["44J3."], system="ctv3"),
+                on_most_recent_day_of_measurement=False,
+                between=["2018-01-01", "2020-03-01"],
+                include_measurement_date=True,
+            ),
+        )
 
 
 def test_patient_random_sample():
@@ -1113,6 +1207,330 @@ def test_patients_registered_practice_as_of():
         deprecated_msoa=["E0203", "E0201", ""],
         region=["London", "East of England", ""],
         pseudo_id=["3", "1", "0"],
+    )
+
+
+def test_patients_registered_practice_as_of_returning_rct():
+    session = make_session()
+
+    # Add a patient at an organisation. The organisation is participating in two RCTs.
+    org_1 = Organisation()
+    patient_1 = Patient()
+    patient_1.RegistrationHistory.append(
+        RegistrationHistory(
+            StartDate="2019-01-01",
+            EndDate="2021-01-01",
+            Organisation=org_1,
+        )
+    )
+    crt_reference_1 = ClusterRandomisedTrialReference(
+        TrialName="germdefence",
+    )
+    crt_reference_1.ClusterRandomisedTrial.append(
+        ClusterRandomisedTrial(
+            Organisation=org_1,
+            TrialArm="1",
+        )
+    )
+
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="deprivation_pctile",
+            PropertyValue="4",
+        )
+    )
+
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="IntCon",
+            PropertyValue="1",
+        )
+    )
+
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="IMD_decile",
+            PropertyValue="4",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="MeanAge",
+            PropertyValue="43.8",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="MedianAge",
+            PropertyValue="33.5",
+        )
+    )
+
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="Av_rooms_per_house",
+            PropertyValue="6.1",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="Minority_ethnic_total",
+            PropertyValue="9.5",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="n_times_visited_mean",
+            PropertyValue="1.34",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="n_pages_viewed_mean",
+            PropertyValue="42.2",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="total_visit_time_mean",
+            PropertyValue="320.33",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="prop_engaged_visits",
+            PropertyValue="6.5",
+        )
+    )
+
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="n_engaged_visits_mean",
+            PropertyValue="316",
+        )
+    )
+
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="n_engaged_pages_viewed_mean_mean",
+            PropertyValue="11.11",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="N_visits_practice",
+            PropertyValue="7",
+        )
+    )
+
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="group_mean_behaviour_mean",
+            PropertyValue="2.64",
+        )
+    )
+
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="group_mean_intention_mean",
+            PropertyValue="3.34",
+        )
+    )
+
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="N_completers_RI_behav",
+            PropertyValue="1",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="N_completers_RI_intent",
+            PropertyValue="9",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="hand_behav_practice_mean",
+            PropertyValue="1.5",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="hand_intent_practice_mean",
+            PropertyValue="4.33",
+        )
+    )
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="N_completers_HW_behav",
+            PropertyValue="11",
+        )
+    )
+
+    crt_reference_1.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="N_goalsetting_completers_per_practice",
+            PropertyValue="3",
+        )
+    )
+
+    crt_reference_2 = ClusterRandomisedTrialReference(
+        TrialName="coffeeintervention",
+    )
+    crt_reference_2.ClusterRandomisedTrial.append(
+        ClusterRandomisedTrial(
+            Organisation=org_1,
+            TrialArm="intervention",
+        )
+    )
+    crt_reference_2.ClusterRandomisedTrialDetail.append(
+        ClusterRandomisedTrialDetail(
+            Organisation=org_1,
+            Property="blend",
+            PropertyValue="arabica",
+        )
+    )
+
+    # Add another patient at another organisation. The organisation isn't participating
+    # in any RCTs.
+    patient_2 = Patient()
+    patient_2.RegistrationHistory.append(
+        RegistrationHistory(
+            StartDate="2019-01-01",
+            EndDate="2021-01-01",
+            Organisation=Organisation(),
+        )
+    )
+
+    session.add_all([org_1, patient_1, crt_reference_1, crt_reference_2, patient_2])
+    session.commit()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        is_germdefence=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__enrolled"
+        ),
+        germdefence_trial_arm=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__trial_arm"
+        ),
+        germdefence_deprivation_pctile=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__deprivation_pctile"
+        ),
+        germdefence_intcon=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__intcon"
+        ),
+        germdefence_imd_decile=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__imd_decile"
+        ),
+        germdefence_meanage=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__meanage"
+        ),
+        germdefence_medianage=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__medianage"
+        ),
+        germdefence_rooms=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__av_rooms_per_house"
+        ),
+        germdefence_eth=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__minority_ethnic_total"
+        ),
+        germdefence_n_visits=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__n_times_visited_mean"
+        ),
+        germdefence_n_pages=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__n_pages_viewed_mean"
+        ),
+        germdefence_visit_time_mean=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__total_visit_time_mean"
+        ),
+        germdefence_prop_engaged_visits=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__prop_engaged_visits"
+        ),
+        germdefence_n_engaged_visits=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__n_engaged_visits_mean"
+        ),
+        germdefence_n_engaged_pages=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__n_engaged_pages_viewed_mean_mean"
+        ),
+        germdefence_n_visits_practice=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__n_visits_practice"
+        ),
+        germdefence_group_beh_mean=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__group_mean_behaviour_mean"
+        ),
+        germdefence_int_mean=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__group_mean_intention_mean"
+        ),
+        germdefence_completer_beh=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__n_completers_ri_behav"
+        ),
+        germdefence_completer_intent=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__n_completers_ri_intent"
+        ),
+        germdefence_prop_handwashing_mean=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__hand_behav_practice_mean"
+        ),
+        germdefence_handwashing_intent=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__hand_intent_practice_mean"
+        ),
+        germdefence_hw_beh=patients.registered_practice_as_of(
+            "2020-01-01", returning="rct__germdefence__n_completers_hw_behav"
+        ),
+        germdefence_goal_setters=patients.registered_practice_as_of(
+            "2020-01-01",
+            returning="rct__germdefence__n_goalsetting_completers_per_practice",
+        ),
+    )
+
+    assert_results(
+        study.to_dicts(),
+        is_germdefence=["1", "0"],
+        germdefence_trial_arm=["1", ""],
+        germdefence_deprivation_pctile=["4", ""],
+        germdefence_intcon=["1", ""],
+        germdefence_imd_decile=["4", ""],
+        germdefence_meanage=["43.8", ""],
+        germdefence_medianage=["33.5", ""],
+        germdefence_rooms=["6.1", ""],
+        germdefence_eth=["9.5", ""],
+        germdefence_n_visits=["1.34", ""],
+        germdefence_n_pages=["42.2", ""],
+        germdefence_visit_time_mean=["320.33", ""],
+        germdefence_prop_engaged_visits=["6.5", ""],
+        germdefence_n_engaged_visits=["316", ""],
+        germdefence_n_engaged_pages=["11.11", ""],
+        germdefence_n_visits_practice=["7", ""],
+        germdefence_group_beh_mean=["2.64", ""],
+        germdefence_int_mean=["3.34", ""],
+        germdefence_completer_beh=["1", ""],
+        germdefence_completer_intent=["9", ""],
+        germdefence_prop_handwashing_mean=["1.5", ""],
+        germdefence_handwashing_intent=["4.33", ""],
+        germdefence_hw_beh=["11", ""],
+        germdefence_goal_setters=["3", ""],
     )
 
 
@@ -1437,24 +1855,58 @@ def test_patients_with_these_codes_on_death_certificate():
             # Not dead
             Patient(),
             # Died after date cutoff
-            ONSDeaths(Patient=Patient(), dod="2021-01-01", icd10u=code),
+            ONSDeaths(
+                Patient=Patient(),
+                dod="2021-01-01",
+                icd10u=code,
+                Place_of_occurrence="Home",
+            ),
             # Died of something else
-            ONSDeaths(Patient=Patient(), dod="2020-02-01", icd10u="MI"),
+            ONSDeaths(
+                Patient=Patient(),
+                dod="2020-02-01",
+                icd10u="MI",
+                Place_of_occurrence="Hospital",
+            ),
             # Covid underlying cause
             ONSDeaths(
-                Patient=patient_with_dupe, dod="2020-02-01", icd10u=code, ICD10014="MI"
+                Patient=patient_with_dupe,
+                dod="2020-02-01",
+                icd10u=code,
+                ICD10014="MI",
+                Place_of_occurrence="Hospice",
             ),
             # A duplicate (the raw data does contain exact dupes, unfortunately)
             ONSDeaths(
-                Patient=patient_with_dupe, dod="2020-02-01", icd10u=code, ICD10014="MI"
+                Patient=patient_with_dupe,
+                dod="2020-02-01",
+                icd10u=code,
+                ICD10014="MI",
+                Place_of_occurrence="Hospice",
             ),
             # A duplicate with a different date of death (which now we have to handle)
             ONSDeaths(
-                Patient=patient_with_dupe, dod="2020-02-02", icd10u=code, ICD10014="MI"
+                Patient=patient_with_dupe,
+                dod="2020-02-02",
+                icd10u=code,
+                ICD10014="MI",
+                Place_of_occurrence="Hospice",
             ),
             # A duplicate with a different date of death (which now we have to handle)
             ONSDeaths(
-                Patient=patient_with_dupe, dod="2020-02-02", icd10u=code, ICD10014="MI"
+                Patient=patient_with_dupe,
+                dod="2020-02-02",
+                icd10u=code,
+                ICD10014="MI",
+                Place_of_occurrence="Hospice",
+            ),
+            # A duplicate with a different place of death (which now we have to handle)
+            ONSDeaths(
+                Patient=patient_with_dupe,
+                dod="2020-02-02",
+                icd10u=code,
+                ICD10014="MI",
+                Place_of_occurrence="Elsewhere",
             ),
             # A duplicate with a different underlying CoD (which now we have to handle)
             ONSDeaths(
@@ -1462,9 +1914,16 @@ def test_patients_with_these_codes_on_death_certificate():
                 dod="2020-02-02",
                 icd10u="MI",
                 ICD10014="COVID",
+                Place_of_occurrence="Hospice",
             ),
             # Covid not underlying cause
-            ONSDeaths(Patient=Patient(), dod="2020-03-01", icd10u="MI", ICD10014=code),
+            ONSDeaths(
+                Patient=Patient(),
+                dod="2020-03-01",
+                icd10u="MI",
+                ICD10014=code,
+                Place_of_occurrence="Care home",
+            ),
         ]
     )
     session.commit()
@@ -1490,12 +1949,25 @@ def test_patients_with_these_codes_on_death_certificate():
             match_only_underlying_cause=False,
             returning="underlying_cause_of_death",
         ),
+        place_of_death=patients.with_these_codes_on_death_certificate(
+            covid_codelist,
+            on_or_before="2020-06-01",
+            match_only_underlying_cause=False,
+            returning="place_of_death",
+        ),
     )
     results = study.to_dicts()
     assert [i["died_of_covid"] for i in results] == ["0", "0", "0", "1", "0"]
     assert [i["died_with_covid"] for i in results] == ["0", "0", "0", "1", "1"]
     assert [i["date_died"] for i in results] == ["", "", "", "2020-02-01", "2020-03-01"]
     assert [i["underlying_cause"] for i in results] == ["", "", "", code, "MI"]
+    assert [i["place_of_death"] for i in results] == [
+        "",
+        "",
+        "",
+        "Elsewhere",
+        "Care home",
+    ]
 
 
 def test_patients_died_from_any_cause():
@@ -1505,9 +1977,15 @@ def test_patients_died_from_any_cause():
             # Not dead
             Patient(),
             # Died after date cutoff
-            Patient(ONSDeath=[ONSDeaths(dod="2021-01-01")]),
+            Patient(ONSDeath=[ONSDeaths(dod="2021-01-01", Place_of_occurrence="Home")]),
             # Died
-            Patient(ONSDeath=[ONSDeaths(dod="2020-02-01", icd10u="A")]),
+            Patient(
+                ONSDeath=[
+                    ONSDeaths(
+                        dod="2020-02-01", icd10u="A", Place_of_occurrence="Hospice"
+                    )
+                ]
+            ),
         ]
     )
     session.commit()
@@ -1523,11 +2001,16 @@ def test_patients_died_from_any_cause():
             on_or_before="2020-06-01",
             returning="underlying_cause_of_death",
         ),
+        place_of_death=patients.died_from_any_cause(
+            on_or_before="2020-06-01",
+            returning="place_of_death",
+        ),
     )
     results = study.to_dicts()
     assert [i["died"] for i in results] == ["0", "0", "1"]
     assert [i["date_died"] for i in results] == ["", "", "2020-02-01"]
     assert [i["underlying_cause"] for i in results] == ["", "", "A"]
+    assert [i["place_of_death"] for i in results] == ["", "", "Hospice"]
 
 
 def test_patients_with_death_recorded_in_cpns():
@@ -1706,14 +2189,14 @@ def test_quote_against_db():
 
 def test_escape_like_query_fragment():
     assert escape_like_query_fragment("foo") == "foo"
-    assert escape_like_query_fragment("foo%bar_") == "foo\\%bar\\_"
+    assert escape_like_query_fragment("foo%bar_") == "foo!%bar!_"
 
 
 def test_escape_like_query_fragment_against_db():
     session = make_session()
     cases = [
         ("foobar", "ob", True),
-        ("foo[]\\%_^bar", "o[]\\%_^b", True),
+        ("foo[]!%_^bar", "o[]!%_^b", True),
         ("foobar", "f%r", False),
     ]
     for text, pattern, should_match in cases:
@@ -1721,7 +2204,7 @@ def test_escape_like_query_fragment_against_db():
         result = session.execute(
             f"SELECT value FROM"
             f"  (VALUES({quote(text)})) AS t(value)"
-            f"  WHERE value LIKE {quote(like_pattern)} ESCAPE '\\'"
+            f"  WHERE value LIKE {quote(like_pattern)} ESCAPE '!'"
         )
         # print(f"'{text}' should{'' if should_match else ' not'} match '{pattern}'")
         if should_match:
@@ -2197,11 +2680,14 @@ def test_patients_with_test_result_in_sgss():
                         Specimen_Date="2020-05-15",
                         Variant="B.1.351",
                         VariantDetectionMethod="Private Lab Sequencing",
+                        Symptomatic="Y",
                     ),
                     SGSS_AllTests_Positive(Specimen_Date="2020-05-20"),
                 ],
                 SGSS_AllTests_Negatives=[
-                    SGSS_AllTests_Negative(Specimen_Date="2020-05-02"),
+                    SGSS_AllTests_Negative(
+                        Specimen_Date="2020-05-02", Symptomatic="false"
+                    ),
                     SGSS_AllTests_Negative(Specimen_Date="2020-07-10"),
                 ],
             ),
@@ -2215,13 +2701,17 @@ def test_patients_with_test_result_in_sgss():
                     )
                 ],
                 SGSS_AllTests_Negatives=[
-                    SGSS_AllTests_Negative(Specimen_Date="2020-04-01")
+                    SGSS_AllTests_Negative(
+                        Specimen_Date="2020-04-01",
+                        Symptomatic="false",
+                    ),
                 ],
                 SGSS_AllTests_Positives=[
                     SGSS_AllTests_Positive(
                         Specimen_Date="2020-04-20",
                         Variant="VOC-20DEC-01 detected",
                         VariantDetectionMethod="Reflex Assay",
+                        Symptomatic="N",
                     ),
                     SGSS_AllTests_Positive(Specimen_Date="2020-05-02"),
                 ],
@@ -2230,6 +2720,30 @@ def test_patients_with_test_result_in_sgss():
                 SGSS_Negatives=[SGSS_Negative(Earliest_Specimen_Date="2020-04-01")],
                 SGSS_AllTests_Negatives=[
                     SGSS_AllTests_Negative(Specimen_Date="2020-04-01")
+                ],
+            ),
+            Patient(
+                SGSS_Negatives=[SGSS_Negative(Earliest_Specimen_Date="2020-04-01")],
+                SGSS_Positives=[SGSS_Positive(Earliest_Specimen_Date="2020-04-20")],
+                SGSS_AllTests_Negatives=[
+                    SGSS_AllTests_Negative(
+                        Specimen_Date="2020-04-01",
+                    ),
+                ],
+                SGSS_AllTests_Positives=[
+                    SGSS_AllTests_Positive(
+                        Specimen_Date="2020-04-20",
+                        Symptomatic="U",
+                    ),
+                ],
+            ),
+            Patient(
+                SGSS_Negatives=[SGSS_Negative(Earliest_Specimen_Date="2020-04-01")],
+                SGSS_AllTests_Negatives=[
+                    SGSS_AllTests_Negative(
+                        Specimen_Date="2020-04-01",
+                        Symptomatic="true",
+                    )
                 ],
             ),
             Patient(),
@@ -2299,24 +2813,86 @@ def test_patients_with_test_result_in_sgss():
             restrict_to_earliest_specimen_date=False,
             returning="variant_detection_method",
         ),
+        symptomatic_positive=patients.with_test_result_in_sgss(
+            pathogen="SARS-CoV-2",
+            test_result="positive",
+            find_first_match_in_period=True,
+            restrict_to_earliest_specimen_date=False,
+            returning="symptomatic",
+        ),
+        symptomatic_negative=patients.with_test_result_in_sgss(
+            pathogen="SARS-CoV-2",
+            test_result="negative",
+            find_first_match_in_period=True,
+            restrict_to_earliest_specimen_date=False,
+            returning="symptomatic",
+        ),
+        symptomatic_any=patients.with_test_result_in_sgss(
+            pathogen="SARS-CoV-2",
+            test_result="any",
+            find_first_match_in_period=True,
+            restrict_to_earliest_specimen_date=False,
+            returning="symptomatic",
+        ),
+        number_of_neg_sgss_tests=patients.with_test_result_in_sgss(
+            pathogen="SARS-CoV-2",
+            test_result="negative",
+            restrict_to_earliest_specimen_date=False,
+            returning="number_of_matches_in_period",
+        ),
+        number_of_pos_sgss_tests=patients.with_test_result_in_sgss(
+            pathogen="SARS-CoV-2",
+            test_result="positive",
+            restrict_to_earliest_specimen_date=False,
+            returning="number_of_matches_in_period",
+        ),
+        number_of_all_sgss_tests=patients.with_test_result_in_sgss(
+            pathogen="SARS-CoV-2",
+            test_result="any",
+            restrict_to_earliest_specimen_date=False,
+            returning="number_of_matches_in_period",
+        ),
+        number_of_all_sgss_tests_before_may=patients.with_test_result_in_sgss(
+            pathogen="SARS-CoV-2",
+            test_result="any",
+            on_or_before="2020-05-01",
+            restrict_to_earliest_specimen_date=False,
+            returning="number_of_matches_in_period",
+        ),
     )
     assert_results(
         study.to_dicts(),
-        positive_covid_test_ever=["1", "1", "0", "0"],
-        negative_covid_test_ever=["1", "1", "1", "0"],
-        tested_before_may=["0", "1", "1", "0"],
+        positive_covid_test_ever=["1", "1", "0", "1", "0", "0"],
+        negative_covid_test_ever=["1", "1", "1", "1", "1", "0"],
+        tested_before_may=["0", "1", "1", "1", "1", "0"],
         first_positive_test_date=[
             "2020-05-15",
             "2020-04-20",
             "",
+            "2020-04-20",
+            "",
             "",
         ],
-        case_category=["PCR_Only", "LFT_WithPCR", "", ""],
-        first_negative_after_a_positive=["2020-07-10", "", "", ""],
-        last_positive_test_date=["2020-05-20", "2020-05-02", "", ""],
-        sgtf_result=["9", "1", "", ""],
-        variant=["B.1.351", "VOC-20DEC-01", "", ""],
-        variant_detection_method=["Private Lab Sequencing", "Reflex Assay", "", ""],
+        case_category=["PCR_Only", "LFT_WithPCR", "", "", "", ""],
+        first_negative_after_a_positive=["2020-07-10", "", "", "", "", ""],
+        last_positive_test_date=["2020-05-20", "2020-05-02", "", "2020-04-20", "", ""],
+        sgtf_result=["9", "1", "", "", "", ""],
+        variant=["B.1.351", "VOC-20DEC-01", "", "", "", ""],
+        variant_detection_method=[
+            "Private Lab Sequencing",
+            "Reflex Assay",
+            "",
+            "",
+            "",
+            "",
+        ],
+        symptomatic_positive=["Y", "N", "", "", "", ""],
+        symptomatic_negative=["N", "N", "", "", "Y", ""],
+        symptomatic_any=["N", "N", "", "", "Y", ""],
+        number_of_neg_sgss_tests=["2", "1", "1", "1", "1", "0"],
+        number_of_pos_sgss_tests=["2", "2", "0", "1", "0", "0"],
+        number_of_all_sgss_tests=["4", "3", "1", "2", "1", "0"],
+        number_of_all_sgss_tests_before_may=["0", "2", "1", "2", "1", "0"],
     )
 
 
@@ -3226,7 +3802,7 @@ def test_dynamic_index_dates():
         [
             Patient(
                 CodedEvents=[
-                    CodedEvent(ConsultationDate="2020-01-01", CTV3Code="foo"),
+                    CodedEvent(ConsultationDate="2020-01-15", CTV3Code="foo"),
                     CodedEvent(ConsultationDate="2020-02-01", CTV3Code="foo"),
                     CodedEvent(ConsultationDate="2020-03-01", CTV3Code="bar"),
                     CodedEvent(ConsultationDate="2020-04-20", CTV3Code="foo"),
@@ -3255,12 +3831,19 @@ def test_dynamic_index_dates():
     session.commit()
     study = StudyDefinition(
         population=patients.all(),
+        earliest_foo=patients.with_these_clinical_events(
+            codelist(["foo"], system="ctv3"),
+            returning="date",
+            date_format="YYYY-MM-DD",
+            find_first_match_in_period=True,
+        ),
         earliest_bar=patients.with_these_clinical_events(
             codelist(["bar"], system="ctv3"),
             returning="date",
             date_format="YYYY-MM-DD",
             find_first_match_in_period=True,
         ),
+        earliest_foo_or_bar=patients.minimum_of("earliest_foo", "earliest_bar"),
         latest_foo_before_bar=patients.with_these_clinical_events(
             codelist(["foo"], system="ctv3"),
             returning="date",
@@ -3275,10 +3858,10 @@ def test_dynamic_index_dates():
             find_last_match_in_period=True,
             on_or_before="last_day_of_month(earliest_bar) + 1 month",
         ),
-        positive_test_after_bar=patients.with_test_result_in_sgss(
+        positive_test_after_foo_or_bar=patients.with_test_result_in_sgss(
             pathogen="SARS-CoV-2",
             test_result="positive",
-            on_or_after="earliest_bar",
+            on_or_after="earliest_foo_or_bar + 1 day",
             find_first_match_in_period=True,
             returning="date",
             date_format="YYYY-MM-DD",
@@ -3293,10 +3876,12 @@ def test_dynamic_index_dates():
     )
     assert_results(
         study.to_dicts(),
+        earliest_foo=["2020-01-15"],
         earliest_bar=["2020-03-01"],
+        earliest_foo_or_bar=["2020-01-15"],
         latest_foo_before_bar=["2020-02-01"],
         latest_foo_in_month_after_bar=["2020-04-20"],
-        positive_test_after_bar=["2020-05-01"],
+        positive_test_after_foo_or_bar=["2020-05-01"],
         practice_id_at_bar=["2"],
         deregistration_date=["2020-12-10"],
     )
@@ -3316,6 +3901,83 @@ def test_dynamic_index_dates_with_invalid_expression():
                 on_or_before="last_day_of_month(earliest_bar) + 1 mnth",
             ),
         )
+
+
+@pytest.mark.parametrize(
+    "index_date,expected_patient_ids",
+    [
+        ("2020-02-15", ["2", "3"]),  # nhs financial year 2019-04-01 to 2020-03-31
+        ("2017-05-15", ["4", "5"]),  # nhs financial year 2017-04-01 to 2018-03-31
+    ],
+)
+def test_nhs_financial_year_date_expressions(index_date, expected_patient_ids):
+    session = make_session()
+    session.add_all(
+        [
+            # Event too early
+            Patient(
+                Patient_ID=1,
+                DateOfBirth="1980-01-01",
+                CodedEvents=[CodedEvent(ConsultationDate="2012-12-15", CTV3Code="foo")],
+            ),
+            # Events in range 2019-04-01 to 2020-03-31
+            Patient(
+                Patient_ID=2,
+                DateOfBirth="1980-05-01",
+                CodedEvents=[CodedEvent(ConsultationDate="2019-05-01", CTV3Code="foo")],
+            ),
+            Patient(
+                Patient_ID=3,
+                DateOfBirth="1980-05-01",
+                CodedEvents=[CodedEvent(ConsultationDate="2020-02-15", CTV3Code="foo")],
+            ),
+            # Events in range 2017-04-01 to 2018-03-31
+            Patient(
+                Patient_ID=4,
+                DateOfBirth="1980-07-01",
+                CodedEvents=[CodedEvent(ConsultationDate="2018-02-01", CTV3Code="foo")],
+            ),
+            Patient(
+                Patient_ID=5,
+                DateOfBirth="1980-07-01",
+                CodedEvents=[CodedEvent(ConsultationDate="2017-06-01", CTV3Code="foo")],
+            ),
+            # Events out of range (at beginning/end of adjacent financial years)
+            Patient(
+                Patient_ID=6,
+                DateOfBirth="1980-01-01",
+                CodedEvents=[CodedEvent(ConsultationDate="2017-03-31", CTV3Code="foo")],
+            ),
+            Patient(
+                Patient_ID=7,
+                DateOfBirth="1980-01-01",
+                CodedEvents=[CodedEvent(ConsultationDate="2018-04-01", CTV3Code="foo")],
+            ),
+            Patient(
+                Patient_ID=8,
+                DateOfBirth="1980-01-01",
+                CodedEvents=[CodedEvent(ConsultationDate="2019-03-31", CTV3Code="foo")],
+            ),
+            Patient(
+                Patient_ID=9,
+                DateOfBirth="1980-01-01",
+                CodedEvents=[CodedEvent(ConsultationDate="2020-04-01", CTV3Code="foo")],
+            ),
+        ]
+    )
+    session.commit()
+    study = StudyDefinition(
+        index_date=index_date,
+        population=patients.with_these_clinical_events(
+            codelist(["foo"], system="ctv3"),
+            between=[
+                "first_day_of_nhs_financial_year(index_date)",
+                "last_day_of_nhs_financial_year(index_date)",
+            ],
+        ),
+    )
+    results = study.to_dicts()
+    assert_results(results, patient_id=expected_patient_ids)
 
 
 def test_high_cost_drugs():
@@ -3649,3 +4311,457 @@ def test_decision_support_values_with_ignore_missing_values(returning, expected)
         ),
     )
     assert_results(study.to_dicts(), efi=expected)
+
+
+def test_with_healthcare_worker_flag_on_covid_vaccine_record():
+    session = make_session()
+    session.add_all(
+        [
+            Patient(HealthCareWorker=[HealthCareWorker(HealthCareWorker="Y")]),
+            Patient(
+                HealthCareWorker=[
+                    HealthCareWorker(HealthCareWorker="Y"),
+                    HealthCareWorker(HealthCareWorker="Y"),
+                ]
+            ),
+            Patient(HealthCareWorker=[HealthCareWorker(HealthCareWorker="N")]),
+            Patient(),
+        ]
+    )
+    session.commit()
+    study = StudyDefinition(
+        population=patients.all(),
+        hcw=patients.with_healthcare_worker_flag_on_covid_vaccine_record(),
+    )
+    assert_results(study.to_dicts(), hcw=["1", "1", "0", "0"])
+
+
+def _make_patient_with_outpatient_appointment():
+    """Makes patients with Outpatient Appointments"""
+    session = make_session()
+    session.add_all(
+        [
+            Patient(
+                OPAEpisodes=[
+                    OPA(
+                        Appointment_Date="2021-01-01 12:00:00.000",
+                        Attendance_Status="6",
+                        First_Attendance="1",
+                        Treatment_Function_Code="130",
+                        Consultation_Medium_Used="10",
+                    ),
+                ]
+            ),
+            Patient(
+                OPAEpisodes=[
+                    OPA(
+                        Appointment_Date="2021-01-01 12:00:00.000",
+                        Attendance_Status="7",
+                        First_Attendance="4",
+                        Treatment_Function_Code="180",
+                        Consultation_Medium_Used="20",
+                    ),
+                    OPA(
+                        Appointment_Date="2021-01-02 12:00:00.000",
+                        Attendance_Status="5",
+                        First_Attendance="2",
+                        Treatment_Function_Code="812",
+                        OPA_Proc=[OPA_Proc(Primary_Procedure_Code="S603")],
+                        Consultation_Medium_Used="30",
+                    ),
+                ]
+            ),
+            Patient(
+                OPAEpisodes=[
+                    OPA(
+                        Appointment_Date="2021-01-02 12:00:00.000",
+                        Ethnic_Category="GF",
+                        Attendance_Status="3",
+                        First_Attendance="3",
+                        Treatment_Function_Code="180",
+                        OPA_Proc=[OPA_Proc(Primary_Procedure_Code="D071")],
+                        Consultation_Medium_Used="40",
+                    ),
+                    OPA(
+                        Appointment_Date="2021-01-03 12:00:00.000",
+                        Ethnic_Category="GF",
+                        First_Attendance="4",
+                        Treatment_Function_Code="320",
+                        Consultation_Medium_Used="50",
+                    ),
+                ],
+            ),
+            Patient(),
+        ]
+    )
+    session.commit()
+
+
+def test_outpatient_appointment_date_returning_binary_flag():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(returning="binary_flag"),
+    )
+    assert_results(study.to_dicts(), opa=["1", "1", "1", "0"])
+
+
+def test_outpatient_appointment_date_returning_binary_flag_on_or_after():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(
+            returning="binary_flag", on_or_after="2021-01-02"
+        ),
+    )
+    assert_results(study.to_dicts(), opa=["0", "1", "1", "0"])
+
+
+def test_outpatient_appointment_date_returning_binary_flag_attended():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(
+            returning="binary_flag", attended=True
+        ),
+    )
+    assert_results(study.to_dicts(), opa=["1", "1", "0", "0"])
+
+
+def test_outpatient_appointment_date_returning_binary_flag_first_attendance():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(
+            returning="binary_flag", is_first_attendance=True
+        ),
+    )
+    assert_results(study.to_dicts(), opa=["1", "0", "1", "0"])
+
+
+def test_outpatient_appointment_date_returning_binary_flag_with_these_treatment_function_codes():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(
+            returning="binary_flag", with_these_treatment_function_codes=["812", "813"]
+        ),
+    )
+    assert_results(study.to_dicts(), opa=["0", "1", "0", "0"])
+
+
+def test_outpatient_appointment_date_returning_binary_flag_with_these_procedure_codes_exact():
+    _make_patient_with_outpatient_appointment()
+
+    procedures_codelist = codelist(["D071", "F172"], system="opcs4")
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(
+            returning="binary_flag", with_these_procedures=procedures_codelist
+        ),
+    )
+    assert_results(study.to_dicts(), opa=["0", "0", "1", "0"])
+
+
+def test_outpatient_appointment_date_returning_binary_flag_with_these_procedure_codes_like():
+    _make_patient_with_outpatient_appointment()
+
+    procedures_codelist = codelist(["D07", "F17"], system="opcs4")
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(
+            returning="binary_flag", with_these_procedures=procedures_codelist
+        ),
+    )
+    assert_results(study.to_dicts(), opa=["0", "0", "1", "0"])
+
+
+def test_outpatient_appointment_date_returning_dates():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(returning="date"),
+    )
+    assert_results(study.to_dicts(), opa=["2021-01-01", "2021-01-02", "2021-01-03", ""])
+
+
+def test_outpatient_appointment_date_returning_dates_first_match():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(
+            returning="date", find_first_match_in_period=True
+        ),
+    )
+    assert_results(study.to_dicts(), opa=["2021-01-01", "2021-01-01", "2021-01-02", ""])
+
+
+def test_outpatient_appointment_date_returning_dates_formatted():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(
+            returning="date", date_format="YYYY-MM"
+        ),
+    )
+    assert_results(study.to_dicts(), opa=["2021-01", "2021-01", "2021-01", ""])
+
+
+def test_outpatient_appointment_date_returning_number_of_matches_in_period():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(
+            returning="number_of_matches_in_period"
+        ),
+    )
+    assert_results(study.to_dicts(), opa=["1", "2", "2", "0"])
+
+
+def test_outpatient_appointment_date_returning_consultation_medium_used():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(
+            returning="consultation_medium_used", find_first_match_in_period=True
+        ),
+    )
+    assert_results(study.to_dicts(), opa=["10", "20", "40", ""])
+
+
+def test_outpatient_appointment_date_returning_consultation_medium_used_last_match():
+    _make_patient_with_outpatient_appointment()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        opa=patients.outpatient_appointment_date(returning="consultation_medium_used"),
+    )
+    assert_results(study.to_dicts(), opa=["10", "30", "50", ""])
+
+
+@pytest.fixture
+def patient_ids():
+    session = make_session()
+    patient_instances = [Patient(), Patient()]
+    session.add_all(patient_instances)
+    session.commit()
+    return [x.Patient_ID for x in patient_instances]
+
+
+def _to_csv(records, tmp_path):
+    f_path = str(tmp_path / "records.csv")
+    pandas.DataFrame(records).to_csv(f_path, index=False)
+    return f_path
+
+
+def test_with_bool_value_from_file(patient_ids, tmp_path):
+    f_path = _to_csv(
+        [{"patient_id": patient_ids[0], "has_asthma": 1}],
+        tmp_path,
+    )
+    study = StudyDefinition(
+        population=patients.all(),
+        case_has_asthma=patients.with_value_from_file(
+            f_path, returning="has_asthma", returning_type="bool"
+        ),
+    )
+    assert_results(study.to_dicts(), case_has_asthma=["1", "0"])  # zero-as-null
+
+
+def test_with_date_value_from_file(patient_ids, tmp_path):
+    f_path = _to_csv(
+        [{"patient_id": patient_ids[0], "index_date": "2021-01-01"}],
+        tmp_path,
+    )
+    study = StudyDefinition(
+        population=patients.all(),
+        case_index_date=patients.with_value_from_file(
+            f_path, returning="index_date", returning_type="date"
+        ),
+    )
+    assert_results(study.to_dicts(), case_index_date=["2021-01-01", ""])
+
+
+def test_with_str_value_from_file(patient_ids, tmp_path):
+    f_path = _to_csv(
+        [{"patient_id": patient_ids[0], "nuts1_region_name": "North East"}],
+        tmp_path,
+    )
+    study = StudyDefinition(
+        population=patients.all(),
+        case_nuts1_region_name=patients.with_value_from_file(
+            f_path, returning="nuts1_region_name", returning_type="str"
+        ),
+    )
+    assert_results(study.to_dicts(), case_nuts1_region_name=["North East", ""])
+
+
+def test_with_int_value_from_file(patient_ids, tmp_path):
+    f_path = _to_csv([{"patient_id": patient_ids[0], "age": 21}], tmp_path)
+    study = StudyDefinition(
+        population=patients.all(),
+        case_age=patients.with_value_from_file(
+            f_path, returning="age", returning_type="int"
+        ),
+    )
+    assert_results(study.to_dicts(), case_age=["21", "0"])
+
+
+def test_with_float_value_from_file(patient_ids, tmp_path):
+    f_path = _to_csv([{"patient_id": patient_ids[0], "bmi": 18.5}], tmp_path)
+    study = StudyDefinition(
+        population=patients.all(),
+        case_bmi=patients.with_value_from_file(
+            f_path, returning="bmi", returning_type="float"
+        ),
+    )
+    assert_results(study.to_dicts(), case_bmi=["18.5", "0.0"])
+
+
+def test_with_value_from_file_with_unexpected_file_type():
+    with pytest.raises(TypeError):
+        StudyDefinition(
+            population=patients.all(),
+            case_bmi=patients.with_value_from_file(
+                "records.feather", returning="bmi", returning_type="float"
+            ),
+        )
+
+
+def test_with_value_from_file_with_missing_returning_arg():
+    with pytest.raises(TypeError):
+        StudyDefinition(
+            population=patients.all(),
+            case_bmi=patients.with_value_from_file(
+                "records.csv", returning=None, returning_type="float"
+            ),
+        )
+
+
+def test_with_value_from_file_with_invalid_returning_arg():
+    with pytest.raises(ValueError):
+        StudyDefinition(
+            population=patients.all(),
+            case_bmi=patients.with_value_from_file(
+                "records.csv", returning="bmi-value", returning_type="float"
+            ),
+        )
+
+
+def test_with_value_from_file_with_value_as_returning_arg(patient_ids, tmp_path):
+    # Test that when the returning argument is "value", cells from the this
+    # column are inserted into the database.
+    f_path = _to_csv(
+        [{"patient_id": patient_ids[0], "value": "North East"}],
+        tmp_path,
+    )
+    study = StudyDefinition(
+        population=patients.all(),
+        case_nuts1_region_name=patients.with_value_from_file(
+            f_path, returning="value", returning_type="str"
+        ),
+    )
+    assert_results(study.to_dicts(), case_nuts1_region_name=["North East", ""])
+
+
+def test_patients_which_exist_in_file(patient_ids, tmp_path):
+    f_path = _to_csv([{"patient_id": patient_ids[0]}], tmp_path)
+    study = StudyDefinition(population=patients.which_exist_in_file(f_path))
+    assert_results(study.to_dicts(), patient_id=[str(patient_ids[0])])
+
+
+def test_using_dates_as_categories():
+    def make_events():
+        return [
+            CodedEvent(CTV3Code="foo", ConsultationDate="2020-05-15"),
+            CodedEvent(CTV3Code="foo", ConsultationDate="2020-07-17"),
+            CodedEvent(CTV3Code="foo", ConsultationDate="2020-09-19"),
+        ]
+
+    session = make_session()
+    session.add_all(
+        [
+            Patient(DateOfBirth="1930-01-01", CodedEvents=make_events()),
+            Patient(DateOfBirth="1945-01-01", CodedEvents=make_events()),
+            Patient(DateOfBirth="1980-01-01", CodedEvents=make_events()),
+        ]
+    )
+    session.commit()
+    study = StudyDefinition(
+        population=patients.all(),
+        eligible_date=patients.categorised_as(
+            {
+                "2020-04-14": "age >= 80",
+                "2020-06-16": "age >= 70 AND age < 80",
+                "2020-08-18": "DEFAULT",
+            },
+            age=patients.age_as_of("2020-01-01"),
+        ),
+        first_event_after_eligible=patients.with_these_clinical_events(
+            codelist(["foo"], system="ctv3"),
+            on_or_after="eligible_date",
+            find_first_match_in_period=True,
+            returning="date",
+            date_format="YYYY-MM-DD",
+        ),
+    )
+    assert_results(
+        study.to_dicts(),
+        eligible_date=["2020-04-14", "2020-06-16", "2020-08-18"],
+        first_event_after_eligible=["2020-05-15", "2020-07-17", "2020-09-19"],
+    )
+
+
+def test_coded_events_reference_ranges():
+    code = "foo1"
+    session = make_session()
+    session.add_all(
+        [
+            Patient(
+                CodedEvents=[
+                    CodedEvent(
+                        CTV3Code=code,
+                        NumericValue=5.0,
+                        CodedEventRange=[
+                            CodedEventRange(
+                                LowerBound=3.0,
+                                UpperBound=8.0,
+                                Comparator=5,
+                            )
+                        ],
+                    ),
+                ]
+            ),
+        ]
+    )
+    session.commit()
+
+    study = StudyDefinition(
+        population=patients.all(),
+        test_result=patients.with_these_clinical_events(
+            codelist([code], system="ctv3"),
+            returning="numeric_value",
+            find_first_match_in_period=True,
+        ),
+        comparator=patients.comparator_from("test_result"),
+        ref_range_lower=patients.reference_range_lower_bound_from("test_result"),
+        ref_range_upper=patients.reference_range_upper_bound_from("test_result"),
+    )
+
+    assert_results(
+        study.to_dicts(),
+        test_result=["5.0"],
+        comparator=[">="],
+        ref_range_lower=["3.0"],
+        ref_range_upper=["8.0"],
+    )

@@ -1,6 +1,6 @@
 """
-The EMIS data is accessed via Presto which is a distributed query engine which
-runs over multiple backing data stores ("connectors" in Presto's parlance).
+The EMIS data is accessed via Trino which is a distributed query engine which
+runs over multiple backing data stores ("connectors" in Trino's parlance).
 The production configuration uses the following connectors:
 
     hive for views
@@ -11,10 +11,8 @@ For immediate convenience while testing we use the SQL Server connector (as we
 already need an instance running for the TPP tests).
 """
 import os
-import time
 import uuid
 
-import sqlalchemy
 from sqlalchemy import (
     BigInteger,
     Column,
@@ -37,8 +35,11 @@ from cohortextractor.emis_backend import (
     ONS_TABLE,
     PATIENT_TABLE,
 )
-from cohortextractor.mssql_utils import mssql_sqlalchemy_engine_from_url
-from cohortextractor.presto_utils import wait_for_presto_to_be_ready
+from cohortextractor.mssql_utils import (
+    mssql_sqlalchemy_engine_from_url,
+    wait_for_mssql_to_be_ready,
+)
+from cohortextractor.trino_utils import wait_for_trino_to_be_ready
 
 Base = declarative_base()
 metadata = Base.metadata
@@ -48,25 +49,14 @@ def make_engine():
     engine = mssql_sqlalchemy_engine_from_url(
         os.environ["EMIS_DATASOURCE_DATABASE_URL"]
     )
-    timeout = os.environ.get("CONNECTION_RETRY_TIMEOUT")
-    timeout = float(timeout) if timeout else 60
-    # Wait for the database to be ready if it isn't already
-    start = time.time()
-    while True:
-        try:
-            engine.connect()
-            break
-        except sqlalchemy.exc.DBAPIError:
-            if time.time() - start < timeout:
-                time.sleep(1)
-            else:
-                raise
-    wait_for_presto_to_be_ready(
+    timeout = float(os.environ.get("CONNECTION_RETRY_TIMEOUT", "60"))
+    wait_for_mssql_to_be_ready(engine, timeout)
+    wait_for_trino_to_be_ready(
         os.environ["EMIS_DATABASE_URL"],
-        # Presto will show active nodes in its `system.runtime.nodes` table but
+        # Trino will show active nodes in its `system.runtime.nodes` table but
         # then throw a "no nodes available" error if you try to execute a query
         # which needs to touch the MSSQL instance. So to properly confirm that
-        # Presto is ready we need a query which forces it to connect to MSSQL,
+        # Trino is ready we need a query which forces it to connect to MSSQL,
         # but ideally one which doesn't depend on any particular configuration
         # having been done first. The below seems to do the trick.
         "SELECT 1 FROM sys.tables",
@@ -85,6 +75,10 @@ def make_session():
 
 def make_database():
     Base.metadata.create_all(make_engine())
+
+
+def clear_database():
+    Base.metadata.drop_all(make_engine())
 
 
 class Patient(Base):

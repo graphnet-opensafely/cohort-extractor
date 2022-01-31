@@ -9,6 +9,11 @@ import pytest
 from cohortextractor import StudyDefinition, codelist, patients
 from cohortextractor.date_expressions import InvalidExpressionError
 from cohortextractor.emis_backend import quote, truncate_patient_id
+from cohortextractor.patients import (
+    max_recorded_value,
+    mean_recorded_value,
+    min_recorded_value,
+)
 from tests.emis_backend_setup import (
     CPNS,
     ICNARC,
@@ -17,6 +22,7 @@ from tests.emis_backend_setup import (
     Observation,
     ONSDeaths,
     Patient,
+    clear_database,
     make_database,
     make_session,
 )
@@ -34,6 +40,10 @@ def set_database_url(monkeypatch):
 
 def setup_module(module):
     make_database()
+
+
+def teardown_module(module):
+    clear_database()
 
 
 def setup_function(function):
@@ -1002,11 +1012,23 @@ def test_bmi_when_only_some_measurements_of_child():
     assert [x["BMI_date_measured"] for x in results] == ["2010-01-01"]
 
 
-def test_mean_recorded_value():
+@pytest.mark.parametrize(
+    "summary_function,expected",
+    [
+        (mean_recorded_value, [("96.0", "2020-02-10"), ("0.0", ""), ("0.0", "")]),
+        (min_recorded_value, [("90.0", "2020-02-10"), ("0.0", ""), ("0.0", "")]),
+        (max_recorded_value, [("100.0", "2020-02-10"), ("0.0", ""), ("0.0", "")]),
+    ],
+)
+def test_summary_recorded_values_on_most_recent_day(summary_function, expected):
     code = "10000001"
     session = make_session()
     patient = Patient()
     values = [
+        # These days are within the period but not the most recent, and should be ignored
+        ("2020-01-01", 110),
+        ("2020-01-02", 80),
+        # This is the most recent day; mean taken from these 3 measurements
         ("2020-02-10", 90),
         ("2020-02-10", 100),
         ("2020-02-10", 98),
@@ -1026,7 +1048,7 @@ def test_mean_recorded_value():
     session.commit()
     study = StudyDefinition(
         population=patients.all(),
-        bp_systolic=patients.mean_recorded_value(
+        bp_systolic=summary_function(
             codelist([code], system="snomedct"),
             on_most_recent_day_of_measurement=True,
             between=["2018-01-01", "2020-03-01"],
@@ -1037,7 +1059,67 @@ def test_mean_recorded_value():
     )
     results = study.to_dicts()
     results = [(i["bp_systolic"], i["bp_systolic_date_measured"]) for i in results]
-    assert results == [("96.0", "2020-02-10"), ("0.0", ""), ("0.0", "")]
+    assert results == expected
+
+
+@pytest.mark.parametrize(
+    "summary_function,expected",
+    [
+        (mean_recorded_value, ["95.6", "0.0", "0.0"]),
+        (min_recorded_value, ["80.0", "0.0", "0.0"]),
+        (max_recorded_value, ["110.0", "0.0", "0.0"]),
+    ],
+)
+def test_summary_recorded_values_across_date_range(summary_function, expected):
+    code = "113075003"
+    session = make_session()
+    patient = Patient()
+    values = [
+        # these 5 are within the period
+        ("2020-01-01", 110),
+        ("2020-01-02", 80),
+        ("2020-02-10", 90),
+        ("2020-02-10", 100),
+        ("2020-02-10", 98),
+        # This day is outside period and should be ignored
+        ("2020-04-01", 110),
+    ]
+    for date, value in values:
+        patient.observations.append(
+            Observation(snomed_concept_id=code, value_pq_1=value, effective_date=date)
+        )
+    patient_with_old_reading = Patient()
+    patient_with_old_reading.observations.append(
+        Observation(snomed_concept_id=code, value_pq_1=100, effective_date="2010-01-01")
+    )
+    patient_with_no_reading = Patient()
+    session.add_all([patient, patient_with_old_reading, patient_with_no_reading])
+    session.commit()
+    study = StudyDefinition(
+        population=patients.all(),
+        creatine=summary_function(
+            codelist([code], system="snomedct"),
+            on_most_recent_day_of_measurement=False,
+            between=["2018-01-01", "2020-03-01"],
+        ),
+    )
+    assert_results(study.to_dicts(), creatine=expected)
+
+
+def test_mean_recorded_value_across_date_range_include_measurement_date_error():
+    with pytest.raises(
+        AssertionError,
+        match="Can only include measurement date if on_most_recent_day_of_measurement is True",
+    ):
+        StudyDefinition(
+            population=patients.all(),
+            creatine=patients.mean_recorded_value(
+                codelist(["113075003"], system="snomedct"),
+                on_most_recent_day_of_measurement=False,
+                between=["2018-01-01", "2020-03-01"],
+                include_measurement_date=True,
+            ),
+        )
 
 
 def test_patients_satisfying():
@@ -1204,7 +1286,10 @@ def test_patients_registered_practice_as_of():
     study = StudyDefinition(
         population=patients.all(),
         stp=patients.registered_practice_as_of("2020-02-01", returning="stp_code"),
-        msoa=patients.registered_practice_as_of("2020-02-01", returning="msoa_code"),
+        msoa=patients.registered_practice_as_of("2020-02-01", returning="msoa"),
+        deprecated_msoa=patients.registered_practice_as_of(
+            "2020-01-01", returning="msoa_code"
+        ),
         region=patients.registered_practice_as_of(
             "2020-02-01", returning="nuts1_region_name"
         ),
@@ -1215,6 +1300,7 @@ def test_patients_registered_practice_as_of():
     results = study.to_dicts()
     assert [i["stp"] for i in results] == ["789"]
     assert [i["msoa"] for i in results] == ["E0203"]
+    assert [i["deprecated_msoa"] for i in results] == ["E0203"]
     assert [i["region"] for i in results] == ["London"]
     assert [i["pseudo_id"] for i in results] == ["abc"]
 
@@ -2052,7 +2138,7 @@ def test_dynamic_index_dates():
         [
             Patient(
                 observations=[
-                    Observation(effective_date="2020-01-01", snomed_concept_id=123),
+                    Observation(effective_date="2020-01-15", snomed_concept_id=123),
                     Observation(effective_date="2020-02-01", snomed_concept_id=123),
                     Observation(effective_date="2020-03-01", snomed_concept_id=456),
                     Observation(effective_date="2020-04-20", snomed_concept_id=123),
@@ -2065,12 +2151,19 @@ def test_dynamic_index_dates():
     session.commit()
     study = StudyDefinition(
         population=patients.all(),
+        earliest_123=patients.with_these_clinical_events(
+            codelist(["123"], system="snomed"),
+            returning="date",
+            date_format="YYYY-MM-DD",
+            find_first_match_in_period=True,
+        ),
         earliest_456=patients.with_these_clinical_events(
             codelist(["456"], system="snomed"),
             returning="date",
             date_format="YYYY-MM-DD",
             find_first_match_in_period=True,
         ),
+        earliest_123_or_456=patients.minimum_of("earliest_123", "earliest_456"),
         latest_123_before_456=patients.with_these_clinical_events(
             codelist(["123"], system="snomed"),
             returning="date",
@@ -2085,12 +2178,22 @@ def test_dynamic_index_dates():
             find_last_match_in_period=True,
             on_or_before="last_day_of_month(earliest_456) + 1 month",
         ),
+        next_123=patients.with_these_clinical_events(
+            codelist(["123"], system="snomed"),
+            returning="date",
+            date_format="YYYY-MM-DD",
+            find_first_match_in_period=True,
+            on_or_after="earliest_123_or_456 + 1 day",
+        ),
     )
     assert_results(
         study.to_dicts(),
+        earliest_123=["2020-01-15"],
         earliest_456=["2020-03-01"],
+        earliest_123_or_456=["2020-01-15"],
         latest_123_before_456=["2020-02-01"],
         latest_123_in_month_after_456=["2020-04-20"],
+        next_123=["2020-02-01"],
     )
 
 
@@ -2108,6 +2211,99 @@ def test_dynamic_index_dates_with_invalid_expression():
                 on_or_before="last_day_of_month(earliest_bar) + 1 mnth",
             ),
         )
+
+
+@pytest.mark.parametrize(
+    "index_date,expected_event_dates",
+    [
+        (
+            "2020-02-15",  # nhs financial year 2019-04-01 to 2020-03-31
+            ["2019-05-01", "2020-02-15"],
+        ),
+        (
+            "2017-05-15",  # nhs financial year 2017-04-01 to 2018-03-31
+            ["2017-06-01", "2018-02-01"],
+        ),
+    ],
+)
+def test_nhs_financial_year_date_expressions(index_date, expected_event_dates):
+    session = make_session()
+    session.add_all(
+        [
+            # Event too early
+            Patient(
+                observations=[
+                    Observation(effective_date="2012-12-15", snomed_concept_id=123)
+                ],
+            ),
+            # Events in range 2019-04-01 to 2020-03-31
+            Patient(
+                observations=[
+                    Observation(effective_date="2019-05-01", snomed_concept_id=123)
+                ],
+            ),
+            Patient(
+                observations=[
+                    Observation(effective_date="2020-02-15", snomed_concept_id=123)
+                ],
+            ),
+            # Events in range 2017-04-01 to 2018-03-31
+            Patient(
+                observations=[
+                    Observation(effective_date="2018-02-01", snomed_concept_id=123)
+                ],
+            ),
+            Patient(
+                observations=[
+                    Observation(effective_date="2017-06-01", snomed_concept_id=123)
+                ],
+            ),
+            # Events out of range (at beginning/end of adjacent financial years)
+            Patient(
+                observations=[
+                    Observation(effective_date="2017-03-31", snomed_concept_id=123)
+                ],
+            ),
+            Patient(
+                observations=[
+                    Observation(effective_date="2018-04-01", snomed_concept_id=123)
+                ],
+            ),
+            Patient(
+                observations=[
+                    Observation(effective_date="2019-03-31", snomed_concept_id=123)
+                ],
+            ),
+            Patient(
+                observations=[
+                    Observation(effective_date="2020-04-01", snomed_concept_id=123)
+                ],
+            ),
+        ]
+    )
+    session.commit()
+    study = StudyDefinition(
+        index_date=index_date,
+        population=patients.with_these_clinical_events(
+            codelist(["123"], system="snomed"),
+            between=[
+                "first_day_of_nhs_financial_year(index_date)",
+                "last_day_of_nhs_financial_year(index_date)",
+            ],
+        ),
+        event_date=patients.with_these_clinical_events(
+            codelist(["123"], system="snomed"),
+            returning="date",
+            date_format="YYYY-MM-DD",
+            between=[
+                "first_day_of_nhs_financial_year(index_date)",
+                "last_day_of_nhs_financial_year(index_date)",
+            ],
+        ),
+    )
+    results = study.to_dicts()
+    event_dates = sorted([result["event_date"] for result in results])
+    assert event_dates == expected_event_dates
 
 
 def test_truncate_patient_id():
@@ -2204,4 +2400,97 @@ def test_null_observation_dates_handled_correctly():
         date_of_last_code=["2020-02-05", "2021-07-02"],
         pre2020_event_date=["1900-01-01", ""],
         date_of_pre2020_code=["1900-01-01", ""],
+    )
+
+
+def test_patients_died_from_any_cause_dynamic_dates():
+    session = make_session()
+    session.add_all(
+        [
+            # Not dead
+            Patient(
+                nhs_no="aaa",
+                medications=[
+                    Medication(snomed_concept_id="10", effective_date="2021-01-02"),
+                ],
+            ),
+            # Died more than 2 weeks after antipsychotic date
+            Patient(
+                nhs_no="bbb",
+                ONSDeath=[
+                    ONSDeaths(
+                        reg_stat_dod=20210201,
+                        pseudonhsnumber="bbb",
+                        upload_date="2021-02-02",
+                    )
+                ],
+                medications=[
+                    Medication(snomed_concept_id="10", effective_date="2021-01-02")
+                ],
+            ),
+            # Died, no antipsychotic
+            Patient(
+                nhs_no="ccc",
+                ONSDeath=[
+                    ONSDeaths(
+                        reg_stat_dod=20210115,
+                        icd10u="A",
+                        pseudonhsnumber="ccc",
+                        upload_date="2021-02-02",
+                    ),
+                ],
+            ),
+            # Died within 2 weeks, antipsychotic before index date
+            Patient(
+                nhs_no="ddd",
+                ONSDeath=[
+                    ONSDeaths(
+                        reg_stat_dod=20200115,
+                        icd10u="A",
+                        pseudonhsnumber="ddd",
+                        upload_date="2021-02-02",
+                    ),
+                ],
+                medications=[
+                    Medication(snomed_concept_id="10", effective_date="2020-01-02"),
+                ],
+            ),
+            # Died within 2 weeks of antipsychotic
+            Patient(
+                nhs_no="eee",
+                ONSDeath=[
+                    ONSDeaths(
+                        reg_stat_dod=20210115,
+                        icd10u="A",
+                        pseudonhsnumber="eee",
+                        upload_date="2021-02-02",
+                    ),
+                ],
+                medications=[
+                    Medication(snomed_concept_id="10", effective_date="2021-01-02"),
+                ],
+            ),
+        ]
+    )
+    session.commit()
+    study = StudyDefinition(
+        population=patients.all(),
+        index_date="2021-01-01",
+        antipsychotics_date=patients.with_these_medications(
+            codelist=codelist(["10"], "snomed"),
+            returning="date",
+            find_last_match_in_period=True,
+            between=["index_date", "last_day_of_month(index_date)"],
+            date_format="YYYY-MM-DD",
+            return_expectations={"incidence": 0.1},
+        ),
+        died_2weeks_post_antipsychotic=patients.died_from_any_cause(
+            between=["antipsychotics_date", "antipsychotics_date + 14 days"],
+            returning="binary_flag",
+        ),
+    )
+    assert_results(
+        study.to_dicts(),
+        antipsychotics_date=["2021-01-02", "2021-01-02", "", "", "2021-01-02"],
+        died_2weeks_post_antipsychotic=["0", "0", "0", "0", "1"],
     )

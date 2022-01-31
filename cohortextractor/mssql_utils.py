@@ -52,10 +52,10 @@ def mssql_dbapi_connection_from_url(url):
         return _pyodbc_connect(pyodbc, params)
 
     raise ImportError(
-        "Unable to import database driver, tried `ctds` and `pyodbc`\n"
+        "Unable to import database driver, tried `pymssql`, `ctds` and `pyodbc`\n"
         "\n"
         "We use `ctds` in production. If you are on Linux the correct version is "
-        "specified in the `requirements.txt` file.\n"
+        "specified in the `requirements.prod.txt` file.\n"
         "\n"
         "Installation instructions for other platforms can be found at:\n"
         "https://zillow.github.io/ctds/install.html"
@@ -85,10 +85,21 @@ def _ctds_connect(ctds, params):
     return ctds.connect(**params)
 
 
+def _pymssql_connect(pymssql, params):
+    # https://pymssql.readthedocs.io/en/stable/ref/pymssql.html#pymssql.connect
+    params = params.copy()
+    params["server"] = params.pop("host")
+    params["user"] = params.pop("username")
+    # Default timeout is 5 seconds. We don't want queries to timeout at all so
+    # set to one week
+    params["timeout"] = 7 * 24 * 60 * 60
+    params["autocommit"] = True
+    return pymssql.connect(**params)
+
+
 def mssql_sqlalchemy_engine_from_url(url):
     params = mssql_connection_params_from_url(url)
-    params["drivername"] = "mssql+pyodbc"
-    params["query"] = {"driver": "ODBC Driver 17 for SQL Server"}
+    params["drivername"] = "mssql+pymssql"
     return sqlalchemy.create_engine(URL(**params))
 
 
@@ -167,3 +178,20 @@ class BatchFetcher:
                     retries -= 1
                     time.sleep(self.sleep)
                     self.cursor = None
+
+
+def wait_for_mssql_to_be_ready(engine, timeout):
+    """
+    Waits for the MS SQL database to be ready by repeatedly attempting to
+    connect, raising the last received error after `timeout` seconds.
+    """
+    start = time.time()
+    while True:
+        try:
+            engine.connect()
+            break
+        except sqlalchemy.exc.DBAPIError:
+            if time.time() - start < timeout:
+                time.sleep(1)
+            else:
+                raise

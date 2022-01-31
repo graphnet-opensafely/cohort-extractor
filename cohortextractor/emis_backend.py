@@ -2,16 +2,15 @@ import datetime
 import os
 import re
 import uuid
-import warnings
 
 import structlog
 
 from .codelistlib import codelist
 from .csv_utils import is_csv_filename, write_rows_to_csv
-from .date_expressions import PrestoDateFormatter
+from .date_expressions import TrinoDateFormatter
 from .expressions import format_expression
 from .pandas_utils import dataframe_from_rows, dataframe_to_file
-from .presto_utils import presto_connection_from_url
+from .trino_utils import trino_connection_from_url
 
 logger = structlog.get_logger()
 sql_logger = structlog.get_logger("cohortextractor.sql")
@@ -271,7 +270,9 @@ class EMISBackend:
         else:
             raise ValueError(f"Unhandled column type: {column_type}")
 
-    def get_case_expression(self, other_columns, column_type, category_definitions):
+    def get_case_expression(
+        self, other_columns, column_type, category_definitions, date_format=None
+    ):
         category_definitions = category_definitions.copy()
         defaults = [k for (k, v) in category_definitions.items() if v == "DEFAULT"]
         if len(defaults) > 1:
@@ -313,7 +314,7 @@ class EMISBackend:
             # value for the column type which is almost always the empty string
             # apart from bools and ints where it's zero.
             default_value=self.get_default_value_for_type(column_type),
-            source_tables=tables_used,
+            source_tables=list(tables_used),
         )
 
     def get_aggregate_expression(
@@ -373,7 +374,7 @@ class EMISBackend:
         ELSE {function}({components}) END""",
             type=column_type,
             default_value=default_value,
-            source_tables=tables_used,
+            source_tables=list(tables_used),
             # It's already been checked that date_format is consistent across
             # the source columns, so we just grab the first one and use the
             # date_format from that
@@ -495,7 +496,7 @@ class EMISBackend:
         Returns two fragements of SQL: a "condition" and a "join"
         The condition is SQL which evaluates true when `date_expr` is in the
         supplied period.
-        The join provides the (possibly empty) JOINs which need to be appened
+        The join provides the (possibly empty) JOINs which need to be appended
         to "table" in order to evaluate the condition.
         """
         if between is None:
@@ -503,6 +504,7 @@ class EMISBackend:
         min_date, max_date = between
         min_date_expr, join_tables1 = self.date_ref_to_sql_expr(min_date)
         max_date_expr, join_tables2 = self.date_ref_to_sql_expr(max_date)
+
         joins = [
             f"LEFT JOIN {join_table}\n"
             f"ON {join_table}.registration_id = {table}.registration_id"
@@ -555,7 +557,7 @@ class EMISBackend:
         if is_iso_date(date):
             return quote(date), []
         # More complicated date expressions which reference other tables
-        formatter = PrestoDateFormatter(self.output_columns)
+        formatter = TrinoDateFormatter(self.output_columns)
         date_expr = formatter(date)
         date_expr, column_name = formatter(date)
         tables = self.output_columns[column_name].source_tables
@@ -725,52 +727,118 @@ class EMISBackend:
         -- XXX maybe add a "WHERE NULL..." here
         """
 
+    def _summarised_recorded_value(
+        self,
+        codelist,
+        on_most_recent_day_of_measurement,
+        between,
+        include_date_of_match,
+        summary_function,
+    ):
+        date_condition, date_joins = self.get_date_condition(
+            OBSERVATION_TABLE, "effective_date", between
+        )
+        codelist_sql = codelist_to_sql(codelist)
+
+        if on_most_recent_day_of_measurement:
+            # The subquery finds, for each patient, the most recent day on which
+            # they've had a measurement. The outer query selects, for each patient,
+            # the mean value on that day.
+            # Note, there's a CAST in the JOIN condition but apparently SQL Server can still
+            # use an index for this. See: https://stackoverflow.com/a/25564539
+            return f"""
+            SELECT
+            days.registration_id,
+            days.hashed_organisation,
+            {summary_function}({OBSERVATION_TABLE}."value_pq_1") AS value,
+            days.date_measured AS date
+            FROM (
+                SELECT
+                    {OBSERVATION_TABLE}.registration_id,
+                    {OBSERVATION_TABLE}.hashed_organisation,
+                    CAST(MAX(effective_date) AS date) AS date_measured
+                FROM {OBSERVATION_TABLE}
+                {date_joins}
+                WHERE snomed_concept_id IN ({codelist_sql}) AND {date_condition}
+                GROUP BY {OBSERVATION_TABLE}.registration_id, {OBSERVATION_TABLE}.hashed_organisation
+            ) AS days
+            LEFT JOIN {OBSERVATION_TABLE}
+            ON (
+            {OBSERVATION_TABLE}.registration_id = days.registration_id
+            AND {OBSERVATION_TABLE}.snomed_concept_id IN ({codelist_sql})
+            AND CAST({OBSERVATION_TABLE}.effective_date AS date) = days.date_measured
+            )
+            GROUP BY days.registration_id, days.hashed_organisation, days.date_measured
+            """
+        else:
+            assert (
+                include_date_of_match is False
+            ), "Can only include measurement date if on_most_recent_day_of_measurement is True"
+
+            return f"""
+            SELECT
+                {OBSERVATION_TABLE}.registration_id,
+                {OBSERVATION_TABLE}.hashed_organisation,
+                {summary_function}({OBSERVATION_TABLE}."value_pq_1") AS value
+            FROM {OBSERVATION_TABLE}
+                {date_joins}
+            WHERE snomed_concept_id IN ({codelist_sql}) AND {date_condition}
+            GROUP BY {OBSERVATION_TABLE}.registration_id, {OBSERVATION_TABLE}.hashed_organisation
+            """
+
     def patients_mean_recorded_value(
         self,
         codelist,
-        # What period is the mean over? (Only one supported option for now)
+        # What period is the mean over?
         on_most_recent_day_of_measurement=None,
         # Set date limits
         between=None,
         # Add additional columns indicating when measurement was taken
         include_date_of_match=False,
     ):
-        # We only support this option for now
-        assert on_most_recent_day_of_measurement
-        date_condition, date_joins = self.get_date_condition(
-            OBSERVATION_TABLE, "effective_date", between
+        return self._summarised_recorded_value(
+            codelist,
+            on_most_recent_day_of_measurement,
+            between,
+            include_date_of_match,
+            "AVG",
         )
-        codelist_sql = codelist_to_sql(codelist)
-        # The subquery finds, for each patient, the most recent day on which
-        # they've had a measurement. The outer query selects, for each patient,
-        # the mean value on that day.
-        # Note, there's a CAST in the JOIN condition but apparently SQL Server can still
-        # use an index for this. See: https://stackoverflow.com/a/25564539
-        sql = f"""
-        SELECT
-          days.registration_id,
-          days.hashed_organisation,
-          AVG({OBSERVATION_TABLE}."value_pq_1") AS value,
-          days.date_measured AS date
-        FROM (
-            SELECT
-                {OBSERVATION_TABLE}.registration_id,
-                {OBSERVATION_TABLE}.hashed_organisation,
-                CAST(MAX(effective_date) AS date) AS date_measured
-            FROM {OBSERVATION_TABLE}
-            {date_joins}
-            WHERE snomed_concept_id IN ({codelist_sql}) AND {date_condition}
-            GROUP BY {OBSERVATION_TABLE}.registration_id, {OBSERVATION_TABLE}.hashed_organisation
-        ) AS days
-        LEFT JOIN {OBSERVATION_TABLE}
-        ON (
-          {OBSERVATION_TABLE}.registration_id = days.registration_id
-          AND {OBSERVATION_TABLE}.snomed_concept_id IN ({codelist_sql})
-          AND CAST({OBSERVATION_TABLE}.effective_date AS date) = days.date_measured
+
+    def patients_min_recorded_value(
+        self,
+        codelist,
+        # What period is the mean over?
+        on_most_recent_day_of_measurement=None,
+        # Set date limits
+        between=None,
+        # Add additional columns indicating when measurement was taken
+        include_date_of_match=False,
+    ):
+        return self._summarised_recorded_value(
+            codelist,
+            on_most_recent_day_of_measurement,
+            between,
+            include_date_of_match,
+            "MIN",
         )
-        GROUP BY days.registration_id, days.hashed_organisation, days.date_measured
-        """
-        return sql
+
+    def patients_max_recorded_value(
+        self,
+        codelist,
+        # What period is the mean over?
+        on_most_recent_day_of_measurement=None,
+        # Set date limits
+        between=None,
+        # Add additional columns indicating when measurement was taken
+        include_date_of_match=False,
+    ):
+        return self._summarised_recorded_value(
+            codelist,
+            on_most_recent_day_of_measurement,
+            between,
+            include_date_of_match,
+            "MAX",
+        )
 
     def patients_registered_as_of(self, reference_date):
         """
@@ -871,7 +939,7 @@ class EMISBackend:
         codelist_table, codelist_queries = self.create_codelist_table(codelist)
         # Using COALESCE like this has the potential to produce very
         # inefficient queries by scuppering use of indices. However, my
-        # understanding is there are no indicies anyway in the current Presto
+        # understanding is there are no indicies anyway in the current Trino
         # setup so this shouldn't actually make much difference
         date_condition, date_joins = self.get_date_condition(
             from_table, f"COALESCE(effective_date, {quote(EARLIEST_DATE)})", between
@@ -1119,11 +1187,12 @@ class EMISBackend:
 
     def patients_registered_practice_as_of(self, date, returning=None):
         # At the moment we can only return current values for the fields in question.
-        self.validate_recent_date(date)
 
         if returning == "stp_code":
             column = "stp_code"
-        elif returning == "msoa_code":
+        # "msoa" is the correct option here, "msoa_code" is supported for
+        # backwards compatibility
+        elif returning in ("msoa", "msoa_code"):
             column = "msoa"
         elif returning == "nuts1_region_name":
             column = "english_region_name"
@@ -1310,7 +1379,6 @@ class EMISBackend:
 
     def patients_address_as_of(self, date, returning=None, round_to_nearest=None):
         # At the moment we can only return current values for the fields in question.
-        self.validate_recent_date(date)
 
         if returning == "index_of_multiple_deprivation":
             assert round_to_nearest == 100
@@ -1399,7 +1467,9 @@ class EMISBackend:
         returning="binary_flag",
     ):
         date_condition, date_joins = self.get_date_condition(
-            "o", "date_parse(CAST(o.reg_stat_dod AS VARCHAR), '%Y%m%d')", between
+            "p",
+            "date_parse(CAST(o.reg_stat_dod AS VARCHAR), '%Y%m%d')",
+            between,
         )
         if codelist is not None:
             assert codelist.system == "icd10"
@@ -1483,21 +1553,13 @@ class EMISBackend:
     def get_db_connection(self):
         if self._db_connection:
             return self._db_connection
-        self._db_connection = presto_connection_from_url(self.database_url)
+        self._db_connection = trino_connection_from_url(self.database_url)
         return self._db_connection
 
     def close(self):
         if self._db_connection:
             self._db_connection.close()
         self._db_connection = None
-
-    def validate_recent_date(self, date, max_delta_days=30):
-        pass
-        date = datetime.datetime.strptime(date, "%Y-%m-%d").date()
-        delta = datetime.date.today() - date
-        if delta.days > max_delta_days:
-            msg = f"{self._current_column_name} should be passed a date more recent than {max_delta_days} days in the past"
-            warnings.warn(msg)
 
 
 class ColumnExpression:

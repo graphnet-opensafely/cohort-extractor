@@ -2,7 +2,12 @@ name: Tag repo; build and publish assets
 on:
   push:
     branches:
-      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: explicit tag to publish (must start with v)
+        required: true
 
 env:
   IMAGE_NAME: cohortextractor
@@ -32,7 +37,7 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           default_bump: false
-
+          release_branches: main
 
   build-and-publish-package:
     runs-on: ubuntu-latest
@@ -49,9 +54,10 @@ jobs:
     - name: Install wheel package
       run: |
         pip install wheel
+    - name: set VERSION environment variable
+      run: echo "VERSION=${{github.event.inputs.tag || needs.tag-new-version.outputs.tag}}" >> $GITHUB_ENV
     - name: Generate correct value for VERSION file
-      run: |
-        echo ${{ needs.tag-new-version.outputs.tag }} > cohortextractor/VERSION
+      run: echo "$VERSION" > cohortextractor/VERSION
     - name: Build package
       run: |
         python setup.py sdist bdist_wheel
@@ -65,25 +71,27 @@ jobs:
     runs-on: ubuntu-latest
     name: Build and publish docker image
     needs: tag-new-version
-    if: needs.tag-new-version.outputs.tag
+    if: github.event.inputs.tag || needs.tag-new-version.outputs.tag
     steps:
     - name: Checkout
       uses: actions/checkout@v1
+    - name: set VERSION environment variable
+      run: echo "VERSION=${{github.event.inputs.tag || needs.tag-new-version.outputs.tag}}" >> $GITHUB_ENV
     - name: Generate correct value for VERSION file
-      run: |
-        echo ${{ needs.tag-new-version.outputs.tag }} > cohortextractor/VERSION
-    - name: Pull image
-      run: docker pull ghcr.io/opensafely-core/cohortextractor
-    - name: Build image
-      run: docker build . --file Dockerfile --tag $IMAGE_NAME
+      run: echo "$VERSION" > cohortextractor/VERSION
+    - name: Build docker
+      run: make docker-build ENV=prod
+    - name: Basic docker test
+      run: docker run cohortextractor --help
     - name: Log into GitHub Container Registry
       run: docker login https://ghcr.io -u ${{ github.actor }} --password ${{ secrets.DOCKER_RW_TOKEN }}
     - name: Push image to GitHub Container Registry
       run: |
+        echo "VERSION=$VERSION"
         IMAGE_ID=ghcr.io/${{ github.repository_owner }}/$IMAGE_NAME
         # Change all uppercase to lowercase
         IMAGE_ID=$(echo $IMAGE_ID | tr '[A-Z]' '[a-z]')
-        VERSION=${{ needs.tag-new-version.outputs.tag }}
         docker tag $IMAGE_NAME $IMAGE_ID:latest
         docker tag $IMAGE_NAME $IMAGE_ID:$VERSION
         docker push $IMAGE_ID:latest
+        docker push $IMAGE_ID:$VERSION

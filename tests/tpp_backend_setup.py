@@ -1,7 +1,5 @@
 import os
-import time
 
-import sqlalchemy
 from sqlalchemy import (
     NVARCHAR,
     Boolean,
@@ -12,30 +10,39 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    types,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 
-from cohortextractor.mssql_utils import mssql_sqlalchemy_engine_from_url
+from cohortextractor.mssql_utils import (
+    mssql_sqlalchemy_engine_from_url,
+    wait_for_mssql_to_be_ready,
+)
+from cohortextractor.tpp_backend import AppointmentStatus
 
 Base = declarative_base()
 
 
+# a SQLAlchemy enum that uses the int values rather than the strings
+class IntEnum(types.TypeDecorator):
+    impl = Integer
+
+    def __init__(self, enumtype, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._enumtype = enumtype
+
+    def process_bind_param(self, value, dialect):
+        return value.value
+
+    def process_result_value(self, value, dialect):
+        return self._enumtype(value)
+
+
 def make_engine():
     engine = mssql_sqlalchemy_engine_from_url(os.environ["TPP_DATABASE_URL"])
-    timeout = os.environ.get("CONNECTION_RETRY_TIMEOUT")
-    timeout = float(timeout) if timeout else 60
-    # Wait for the database to be ready if it isn't already
-    start = time.time()
-    while True:
-        try:
-            engine.connect()
-            break
-        except sqlalchemy.exc.DBAPIError:
-            if time.time() - start < timeout:
-                time.sleep(1)
-            else:
-                raise
+    timeout = float(os.environ.get("CONNECTION_RETRY_TIMEOUT", "60"))
+    wait_for_mssql_to_be_ready(engine, timeout)
     return engine
 
 
@@ -49,6 +56,10 @@ def make_session():
 
 def make_database():
     Base.metadata.create_all(make_engine())
+
+
+def clear_database():
+    Base.metadata.drop_all(make_engine())
 
 
 class MedicationIssue(Base):
@@ -101,7 +112,12 @@ class CodedEvent(Base):
     CTV3Code = Column(String(collation="Latin1_General_BIN"))
     NumericValue = Column(Float)
     ConsultationDate = Column(DateTime)
-    SnomedConceptId = Column(String)
+
+    CodedEventRange = relationship(
+        "CodedEventRange",
+        back_populates="CodedEvent",
+        cascade="all, delete, delete-orphan",
+    )
 
 
 class CodedEventSnomed(Base):
@@ -116,6 +132,32 @@ class CodedEventSnomed(Base):
     ConsultationDate = Column(DateTime)
     ConceptID = Column(String(collation="Latin1_General_BIN"))
     CodingSystem = Column(Integer)
+
+
+class CodedEventRange(Base):
+    __tablename__ = "CodedEventRange"
+
+    CodedEventRange_ID = Column(Integer, primary_key=True)
+
+    CodedEvent_ID = Column(Integer, ForeignKey(CodedEvent.CodedEvent_ID))
+    CodedEvent = relationship(
+        "CodedEvent", back_populates="CodedEventRange", cascade="all, delete"
+    )
+    # These bounds give the "reference range" for the test result in question
+    # Uses `-1` as a placeholder for NULL
+    LowerBound = Column(Float)
+    # Uses `-1` as a placeholder for NULL
+    UpperBound = Column(Float)
+    # Takes the following values:
+    # | Value | Meaning |
+    # |-------|---------|
+    # | 3     | ~       |
+    # | 4     | =       |
+    # | 5     | >=      |
+    # | 6     | >       |
+    # | 7     | <       |
+    # | 8     | <=      |
+    Comparator = Column(Integer)
 
 
 class Appointment(Base):
@@ -133,7 +175,7 @@ class Appointment(Base):
     # The real table has various other datetime columns but we don't currently
     # use them
     SeenDate = Column(DateTime)
-    Status = Column(Integer)
+    Status = Column(IntEnum(AppointmentStatus))
 
 
 class Patient(Base):
@@ -233,8 +275,18 @@ class Patient(Base):
         back_populates="Patient",
         cascade="all, delete, delete-orphan",
     )
+    OPA_Proc = relationship(
+        "OPA_Proc",
+        back_populates="Patient",
+        cascade="all, delete, delete-orphan",
+    )
     DecisionSupportValue = relationship(
         "DecisionSupportValue",
+        back_populates="Patient",
+        cascade="all, delete, delete-orphan",
+    )
+    HealthCareWorker = relationship(
+        "HealthCareWorker",
         back_populates="Patient",
         cascade="all, delete, delete-orphan",
     )
@@ -273,6 +325,14 @@ class Organisation(Base):
         "Appointment",
         back_populates="Organisation",
         cascade="all, delete, delete-orphan",
+    )
+    ClusterRandomisedTrial = relationship(
+        "ClusterRandomisedTrial",
+        back_populates="Organisation",
+    )
+    ClusterRandomisedTrialDetail = relationship(
+        "ClusterRandomisedTrialDetail",
+        back_populates="Organisation",
     )
 
 
@@ -335,6 +395,7 @@ class ONSDeaths(Base):
     ICD10013 = Column(String)
     ICD10014 = Column(String)
     ICD10015 = Column(String)
+    Place_of_occurrence = Column(String)
 
 
 class CPNS(Base):
@@ -733,7 +794,30 @@ class OPA(Base):
     )
     OPA_Ident = Column(Integer, primary_key=True)
     Appointment_Date = Column(Date)
+    Attendance_Status = Column(String)
     Ethnic_Category = Column(String)
+    First_Attendance = Column(String)
+    Treatment_Function_Code = Column(String)
+    Consultation_Medium_Used = Column(String)
+
+    OPA_Proc = relationship(
+        "OPA_Proc", back_populates="OPA", cascade="all, delete, delete-orphan"
+    )
+
+
+class OPA_Proc(Base):
+    __tablename__ = "OPA_Proc"
+
+    Patient_ID = Column(Integer, ForeignKey("Patient.Patient_ID"))
+    Patient = relationship("Patient", back_populates="OPA_Proc")
+    OPA_Ident = Column(Integer, ForeignKey("OPA.OPA_Ident"), primary_key=True)
+    OPA = relationship(
+        "OPA",
+        back_populates="OPA_Proc",
+        cascade="all, delete, delete-orphan",
+        single_parent=True,
+    )
+    Primary_Procedure_Code = Column(String)
 
 
 class DecisionSupportValue(Base):
@@ -749,3 +833,85 @@ class DecisionSupportValue(Base):
     AlgorithmType = Column(Integer)
     CalculationDateTime = Column(DateTime)
     NumericValue = Column(Float)
+
+
+class HealthCareWorker(Base):
+    __tablename__ = "HealthCareWorker"
+
+    # This column isn't in the actual database but SQLAlchemy gets a bit upset
+    # if we don't give it a primary key
+    id = Column(Integer, primary_key=True)
+    Patient_ID = Column(Integer, ForeignKey("Patient.Patient_ID"))
+    Patient = relationship(
+        "Patient", back_populates="HealthCareWorker", cascade="all, delete"
+    )
+    # Only ever contains "Y" so redundant really
+    HealthCareWorker = Column(String)
+
+
+class ClusterRandomisedTrial(Base):
+    """Represents relationships between cluster randomised trials and organisations."""
+
+    __tablename__ = "ClusterRandomisedTrial"
+
+    # This table's PK is probably a composite of Organisation_ID and TrialNumber (we
+    # assume that one organisation can be in one arm of one trial). However, MSSQL
+    # complains when we add `primary_key=True` to two columns. To make life easier, we
+    # use a column that isn't in the database.
+    id = Column(Integer, primary_key=True)
+
+    Organisation_ID = Column(Integer, ForeignKey("Organisation.Organisation_ID"))
+    Organisation = relationship("Organisation", back_populates="ClusterRandomisedTrial")
+
+    TrialNumber = Column(
+        Integer, ForeignKey("ClusterRandomisedTrialReference.TrialNumber")
+    )
+    ClusterRandomisedTrialReference = relationship(
+        "ClusterRandomisedTrialReference", back_populates="ClusterRandomisedTrial"
+    )
+
+    TrialArm = Column(String)
+
+
+class ClusterRandomisedTrialDetail(Base):
+    """Represents mappings of properties to values."""
+
+    __tablename__ = "ClusterRandomisedTrialDetail"
+
+    # This table's PK is probably a composite of Organisation_ID, TrialNumber, and
+    # Property. However, MSSQL complains about Property's type. To make life easier, we
+    # use a column that isn't in the database.
+    id = Column(Integer, primary_key=True)
+
+    TrialNumber = Column(
+        Integer, ForeignKey("ClusterRandomisedTrialReference.TrialNumber")
+    )
+    ClusterRandomisedTrialReference = relationship(
+        "ClusterRandomisedTrialReference", back_populates="ClusterRandomisedTrialDetail"
+    )
+
+    Organisation_ID = Column(Integer, ForeignKey("Organisation.Organisation_ID"))
+    Organisation = relationship(
+        "Organisation", back_populates="ClusterRandomisedTrialDetail"
+    )
+
+    Property = Column(String)
+    PropertyValue = Column(String)
+
+
+class ClusterRandomisedTrialReference(Base):
+    """Represents cluster randomised trial entities."""
+
+    __tablename__ = "ClusterRandomisedTrialReference"
+
+    TrialNumber = Column(Integer, primary_key=True)
+    ClusterRandomisedTrial = relationship(
+        "ClusterRandomisedTrial", back_populates="ClusterRandomisedTrialReference"
+    )
+    ClusterRandomisedTrialDetail = relationship(
+        "ClusterRandomisedTrialDetail", back_populates="ClusterRandomisedTrialReference"
+    )
+
+    TrialName = Column(String)
+    TrialDescription = Column(String)
+    CPMSNumber = Column(Integer)

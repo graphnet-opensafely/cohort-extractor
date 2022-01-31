@@ -2,18 +2,26 @@ import collections
 import copy
 import os
 import re
+import shutil
+from pathlib import Path
 
 import pandas as pd
+import structlog
 from numpy.random import default_rng
 
+from .csv_utils import is_csv_filename
 from .date_expressions import (
     evaluate_date_expressions_in_covariate_definitions,
     evaluate_date_expressions_in_expectations_definition,
     validate_date,
 )
+from .exceptions import DummyDataValidationError
 from .expectation_generators import generate
-from .pandas_utils import dataframe_to_file
+from .pandas_utils import dataframe_from_rows, dataframe_to_file, dataframe_to_rows
 from .process_covariate_definitions import process_covariate_definitions
+from .validate_dummy_data import validate_dummy_data
+
+logger = structlog.get_logger()
 
 
 class StudyDefinition:
@@ -41,7 +49,7 @@ class StudyDefinition:
     def set_index_date(self, index_date):
         """
         Re-evaluate all date expressions in the covariate definitions and the
-        default expecations using the supplied index date and re-initialise the
+        default expectations using the supplied index date and re-initialise the
         backend with the new values
         """
         if index_date is not None:
@@ -58,15 +66,35 @@ class StudyDefinition:
         if self.backend:
             self.recreate_backend()
 
-    def to_file(self, filename, expectations_population=False, **kwargs):
+    def to_file(
+        self, filename, expectations_population=False, dummy_data_file=None, **kwargs
+    ):
         if expectations_population:
             df = self.make_df_from_expectations(expectations_population)
-            # Add a patient ID - a randomly generated integer from an
-            # array 10x larger than the cohort.
-            df["patient_id"] = default_rng().choice(
-                (len(df) * 10), size=len(df), replace=False
-            )
+            if "patient_id" not in df:
+                # Add a patient ID - a randomly generated integer from an
+                # array 10x larger than the cohort.
+                df["patient_id"] = default_rng().choice(
+                    (len(df) * 10), size=len(df), replace=False
+                )
+            if not is_csv_filename(filename):
+                # This slightly convoluted approach means that dummy data
+                # intended for a binary output format gets passed through the
+                # same conversion process as real data (which happens in
+                # `dataframe_from_rows`). Real data intended for CSV output
+                # does not go through this process so we don't do that for
+                # dummy CSV data either.
+                df = dataframe_from_rows(
+                    self.covariate_definitions, dataframe_to_rows(df)
+                )
             dataframe_to_file(df, filename)
+        elif dummy_data_file:
+            if Path(filename).suffixes != dummy_data_file.suffixes:
+                expected_extension = "".join(filename.suffixes)
+                msg = f"Expected dummy data file with extension {expected_extension}; got {dummy_data_file}"
+                raise DummyDataValidationError(msg)
+            validate_dummy_data(self.covariate_definitions, dummy_data_file)
+            shutil.copyfile(dummy_data_file, filename)
         else:
             self.assert_backend_is_configured()
             self.backend.to_file(filename, **kwargs)
@@ -124,7 +152,7 @@ class StudyDefinition:
             from .tpp_backend import TPPBackend
         
             return TPPBackend
-        elif backend == 'emis':
+        elif database_url.startswith("presto://"):
             from .emis_backend import EMISBackend
         
             return EMISBackend
@@ -218,8 +246,16 @@ class StudyDefinition:
                 "index_of_multiple_deprivation",
                 "rural_urban_classification",
             ):
-                dtypes[name] = "category"
-                continue
+                column_type = "str"
+
+            # Another awkward corner: we allow `categorised_as` functions to
+            # return dates, which can then be used as inputs to other
+            # functions. For the purposes of real data extraction they behave
+            # like dates and should be typed as such. However for the purposes
+            # of dummy data generation they act like categoricals (dates get a
+            # whole load of special treatment that we don't want here).
+            if funcname == "categorised_as" and column_type == "date":
+                column_type = "str"
 
             if column_type == "date":
                 parse_dates.append(name)
@@ -255,11 +291,58 @@ class StudyDefinition:
     def make_df_from_expectations(self, population):
         df = pd.DataFrame()
 
-        # Start with dates, so we can use them as inputs for incidence
-        # matching on dependent columns
+        # Start with the user-supplied CSV file
+        for colname, definition_args in self.pandas_csv_args["args"].items():
+            if definition_args["funcname"] not in [
+                "with_value_from_file",
+                "which_exist_in_file",
+            ]:
+                continue
+            f_path = definition_args["f_path"]
+            if not is_csv_filename(f_path):
+                raise ValueError("`f_path` must be a path to a CSV file")
+
+            returning = definition_args.get("returning")
+            returning_type = definition_args.get("returning_type")
+            if returning is not None and returning_type is None:
+                raise ValueError(f"No `returning_type` defined for {colname}")
+            if returning is None and returning_type is not None:
+                raise ValueError(f"No `returning` defined for {colname}")
+            if returning is not None and not re.fullmatch(r"\w+", returning, re.ASCII):
+                raise ValueError(
+                    f"{colname} should contain only alphanumeric characters and the underscore character"
+                )
+
+            usecols = ["patient_id"]
+            if returning is not None:
+                usecols.append(returning)
+            user_df = pd.read_csv(f_path, usecols=usecols, dtype=str)
+            if returning_type == "date":
+                user_df[returning] = pd.to_datetime(
+                    user_df[returning], infer_datetime_format=True
+                )
+
+            df["patient_id"] = user_df["patient_id"]
+            df[colname] = user_df[returning] if returning is not None else 1
+            # The population should be the same size as the number of patients in the
+            # user-supplied CSV file. This ensures we generate no more dummy data than
+            # is necessary.
+            new_population = len(df)
+            if population != new_population:
+                logger.info(
+                    f"Setting population size to {new_population} (was {population}) to match user-supplied CSV file"
+                )
+                population = new_population
+
+        # Now dates, so we can use them as inputs for incidence matching on dependent
+        # columns
         for colname in self.pandas_csv_args["parse_dates"]:
             definition_args = self.pandas_csv_args["args"][colname]
-            if definition_args["funcname"] == "aggregate_of":
+            if definition_args["funcname"] in [
+                "aggregate_of",
+                "with_value_from_file",
+                "which_exist_in_file",
+            ]:
                 continue
             if "source" in definition_args:
                 source_args = self.pandas_csv_args["args"][definition_args["source"]]
@@ -288,7 +371,11 @@ class StudyDefinition:
         # its incidence calculated as a mask
         for colname, dtype in self.pandas_csv_args["dtype"].items():
             definition_args = self.pandas_csv_args["args"][colname]
-            if definition_args["funcname"] == "aggregate_of":
+            if definition_args["funcname"] in [
+                "aggregate_of",
+                "with_value_from_file",
+                "which_exist_in_file",
+            ]:
                 continue
             return_expectations = definition_args["return_expectations"] or {}
             if not self.default_expectations and not return_expectations:
@@ -338,7 +425,9 @@ class StudyDefinition:
                 method_name = "max"
             else:
                 raise ValueError(f"Unsupported aggregate function '{fn}'")
-            columns = df[list(definition_args["column_names"])]
+            columns = self.get_columns_for_aggregation(
+                population, df, list(definition_args["column_names"])
+            )
             aggregate_method = getattr(columns, method_name)
             df[colname] = aggregate_method(axis=1)
 
@@ -350,6 +439,42 @@ class StudyDefinition:
                 df[colname], **definition_args
             )
         return df
+
+    def get_columns_for_aggregation(self, population, df, column_names):
+        extra_columns = {
+            k: v
+            for (k, v) in self.covariate_definitions.items()
+            if k in column_names and v[1]["hidden"]
+        }
+        if extra_columns:
+            extra_study = StudyDefinition(
+                # It doesn't matter what the population is here, it's not
+                # relevant in generating the extra columns we need. But we
+                # can't use the real population definition because that may be
+                # an expression referencing columns which don't appear in our
+                # "extra study" and so will trigger an error.
+                population=("all", {}),
+                default_expectations=self.default_expectations,
+                index_date=self.index_date,
+                **extra_columns,
+            )
+            extra_df = extra_study.make_df_from_expectations(population)
+            non_extra_columns = [
+                c for c in column_names if c not in extra_columns.keys()
+            ]
+            dt = extra_study.pandas_csv_args["args"][list(extra_columns.keys())[0]][
+                "column_type"
+            ]
+            if dt == "date":
+                extra_df = extra_df.apply(pd.to_datetime)
+            if non_extra_columns:
+                extra_df = pd.concat(
+                    [df[non_extra_columns], extra_df], ignore_index=True
+                )
+            columns = extra_df[column_names]
+        else:
+            columns = df[column_names]
+        return columns
 
     def validate_category_expectations(
         self,
@@ -415,7 +540,7 @@ class StudyDefinition:
 
 
 def merge(dict1, dict2):
-    """ Return a new dictionary by merging two dictionaries recursively. """
+    """Return a new dictionary by merging two dictionaries recursively."""
 
     result = copy.deepcopy(dict1)
 

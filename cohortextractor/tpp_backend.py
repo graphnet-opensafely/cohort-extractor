@@ -4,6 +4,7 @@ import hashlib
 import re
 import uuid
 
+import pandas
 import structlog
 
 from .csv_utils import is_csv_filename, write_rows_to_csv
@@ -162,14 +163,18 @@ class TPPBackend:
             # https://docs.microsoft.com/en-us/sql/t-sql/queries/select-into-clause-transact-sql?view=sql-server-ver15#remarks
             conn = self.get_db_connection()
             logger.info(f"Writing results into temporary table '{output_table}'")
-            previous_autocommit = conn.autocommit
-            conn.autocommit = False
+            # pymssql's autocommit implementation is different to CTDS and MS
+            # pyodbc. Firstly, it's a method rather than a property.  Secondly,
+            # when autocommit is off, it implicity starts a transaction from
+            # the client, so we do not need to do it. CTDS do not seem to do
+            # this, which means we would have to begin it manually.
+            previous_autocommit = conn.autocommit_state
+            conn.autocommit(False)
             cursor = conn.cursor()
-            cursor.execute("BEGIN TRANSACTION")
             cursor.execute(f"SELECT * INTO {output_table} FROM ({final_query}) t")
             cursor.execute(f"CREATE INDEX ix_patient_id ON {output_table} (patient_id)")
-            cursor.execute("COMMIT")
-            conn.autocommit = previous_autocommit
+            conn.commit()
+            conn.autocommit(previous_autocommit)
             logger.info(f"Downloading results from '{output_table}'")
         else:
             logger.info(f"Downloading results from previous run in '{output_table}'")
@@ -196,7 +201,7 @@ class TPPBackend:
         test_table = f"{db_name}..test_{uuid.uuid4().hex}"
         cursor = self.get_db_connection().cursor()
         try:
-            cursor.execute(f"SELECT 1 AS foo INTO {test_table}")
+            cursor.execute(f"SELECT * INTO {test_table} FROM (select 1 as foo) t")
             cursor.execute(f"DROP TABLE {test_table}")
         # Because we don't want to depend on a specific database driver we
         # can't catch a specific exception class here
@@ -332,7 +337,9 @@ class TPPBackend:
         else:
             raise ValueError(f"Unhandled column type: {column_type}")
 
-    def get_case_expression(self, other_columns, column_type, category_definitions):
+    def get_case_expression(
+        self, other_columns, column_type, category_definitions, date_format=None
+    ):
         category_definitions = category_definitions.copy()
         defaults = [k for (k, v) in category_definitions.items() if v == "DEFAULT"]
         if len(defaults) > 1:
@@ -344,6 +351,24 @@ class TPPBackend:
             raise ValueError(
                 "At least one category must be given the definition 'DEFAULT'"
             )
+
+        # We pass the `reformat_dates=False` option to the quoting function
+        # here to preserve date-like strings in the user-supplied ISO format,
+        # as opposed to converting to MSSQL-friendly format which we otherwise
+        # do by default. The distinction here is between dates used as inputs
+        # and dates used as outputs. We always need to supply input dates in a
+        # format which will be consistently parsed by MSSQL indepent of locale
+        # settings (amazingly, this does not include ISO format). But we always
+        # want the dates we output to be in ISO format. In almost all cases
+        # user-supplied dates are functioning as inputs, which is why
+        # reformatting is our default behaviour; but in this context they
+        # function as outputs so we need to do something different. (Note that
+        # if these outputs later go on to be supplied as inputs to other
+        # functions then the `date_expressions` code will ensure they are
+        # parsed correctly.)
+        def quote_category(value):
+            return quote(value, reformat_dates=False)
+
         # For each column already defined, determine its corresponding "empty"
         # value (i.e. the default value for that column's type). This allows us
         # to support implicit boolean conversion because we know what the
@@ -361,12 +386,15 @@ class TPPBackend:
             formatted_expression, names_used = format_expression(
                 expression, other_columns, empty_value_map=empty_value_map
             )
-            clauses.append(f"WHEN ({formatted_expression}) THEN {quote(category)}")
+            clauses.append(
+                f"WHEN ({formatted_expression}) THEN {quote_category(category)}"
+            )
             # Record all the source tables used in evaluating the expression
             for name in names_used:
                 tables_used.update(other_columns[name].source_tables)
+
         return ColumnExpression(
-            f"CASE {' '.join(clauses)} ELSE {quote(default_value)} END",
+            f"CASE {' '.join(clauses)} ELSE {quote_category(default_value)} END",
             type=column_type,
             # Note, confusingly, this is not the same as the `default_value`
             # used above. Above it refers to the value the case-expression will
@@ -374,7 +402,8 @@ class TPPBackend:
             # value for the column type which is almost always the empty string
             # apart from bools and ints where it's zero.
             default_value=self.get_default_value_for_type(column_type),
-            source_tables=tables_used,
+            source_tables=list(tables_used),
+            date_format="YYYY-MM-DD" if column_type == "date" else None,
         )
 
     def get_aggregate_expression(
@@ -422,7 +451,7 @@ class TPPBackend:
             f"ISNULL(({aggregate_expression}), {quote(default_value)})",
             type=column_type,
             default_value=default_value,
-            source_tables=tables_used,
+            source_tables=list(tables_used),
             # It's already been checked that date_format is consistent across
             # the source columns, so we just grab the first one and use the
             # date_format from that
@@ -476,17 +505,9 @@ class TPPBackend:
             )
             """
         ]
-        insert_sql = f"INSERT INTO {table_name} (code, category) VALUES"
-        # There's a limit on how many rows we can insert in one go using this method
-        # See: https://docs.microsoft.com/en-us/sql/t-sql/queries/table-value-constructor-transact-sql?view=sql-server-ver15#limitations-and-restrictions
-        batch_size = 999
-        for i in range(0, len(values), batch_size):
-            values_batch = values[i : i + batch_size]
-            values_sql_lines = [
-                "({}, {})".format(*map(quote, row)) for row in values_batch
-            ]
-            values_sql = ",\n".join(values_sql_lines)
-            queries.append(f"{insert_sql}\n{values_sql}")
+        queries += make_batches_of_insert_statements(
+            table_name, ("code", "category"), values
+        )
         return table_name, queries
 
     def get_temp_table_name(self, suffix):
@@ -510,7 +531,7 @@ class TPPBackend:
         The condition is SQL which evaluates true when `date_expr` is in the
         supplied period.
 
-        The join provides the (possibly empty) JOINs which need to be appened
+        The join provides the (possibly empty) JOINs which need to be appended
         to "table" in order to evaluate the condition.
         """
         if between is None:
@@ -749,48 +770,114 @@ class TPPBackend:
         -- XXX maybe add a "WHERE NULL..." here
         """
 
+    def _summarised_recorded_value(
+        self,
+        codelist,
+        on_most_recent_day_of_measurement,
+        between,
+        include_date_of_match,
+        summary_function,
+    ):
+        coded_event_table, coded_event_column = coded_event_table_column(codelist)
+        date_condition, date_joins = self.get_date_condition(
+            coded_event_table, "ConsultationDate", between
+        )
+        codelist_sql = codelist_to_sql(codelist)
+
+        if on_most_recent_day_of_measurement:
+            # The subquery finds, for each patient, the most recent day on which
+            # they've had a measurement. The outer query selects, for each patient,
+            # the mean value on that day.
+            # Note, there's a CAST in the JOIN condition but apparently SQL Server can still
+            # use an index for this. See: https://stackoverflow.com/a/25564539
+            return f"""
+            SELECT
+            days.Patient_ID AS patient_id,
+            {summary_function}({coded_event_table}.NumericValue) AS value,
+            days.date_measured AS date
+            FROM (
+                SELECT {coded_event_table}.Patient_ID, CAST(MAX(ConsultationDate) AS date) AS date_measured
+                FROM {coded_event_table}
+                {date_joins}
+                WHERE {coded_event_column} IN ({codelist_sql}) AND {date_condition}
+                GROUP BY {coded_event_table}.Patient_ID
+            ) AS days
+            LEFT JOIN {coded_event_table}
+            ON (
+            {coded_event_table}.Patient_ID = days.Patient_ID
+            AND {coded_event_table}.{coded_event_column} IN ({codelist_sql})
+            AND CAST({coded_event_table}.ConsultationDate AS date) = days.date_measured
+            )
+            GROUP BY days.Patient_ID, days.date_measured
+            """
+        else:
+            assert (
+                include_date_of_match is False
+            ), "Can only include measurement date if on_most_recent_day_of_measurement is True"
+
+            return f"""
+            SELECT
+                {coded_event_table}.Patient_ID AS patient_id,
+                {summary_function}({coded_event_table}.NumericValue) AS value
+            FROM {coded_event_table}
+                {date_joins}
+            WHERE {coded_event_column} IN ({codelist_sql}) AND {date_condition}
+            GROUP BY {coded_event_table}.Patient_ID
+            """
+
     def patients_mean_recorded_value(
         self,
         codelist,
-        # What period is the mean over? (Only one supported option for now)
+        # What period is the mean over?
         on_most_recent_day_of_measurement=None,
         # Set date limits
         between=None,
         # Add additional columns indicating when measurement was taken
         include_date_of_match=False,
     ):
-        # We only support this option for now
-        assert on_most_recent_day_of_measurement
-        coded_event_table, coded_event_column = coded_event_table_column(codelist)
-        date_condition, date_joins = self.get_date_condition(
-            coded_event_table, "ConsultationDate", between
+        return self._summarised_recorded_value(
+            codelist,
+            on_most_recent_day_of_measurement,
+            between,
+            include_date_of_match,
+            "AVG",
         )
-        codelist_sql = codelist_to_sql(codelist)
-        # The subquery finds, for each patient, the most recent day on which
-        # they've had a measurement. The outer query selects, for each patient,
-        # the mean value on that day.
-        # Note, there's a CAST in the JOIN condition but apparently SQL Server can still
-        # use an index for this. See: https://stackoverflow.com/a/25564539
-        return f"""
-        SELECT
-          days.Patient_ID AS patient_id,
-          AVG({coded_event_table}.NumericValue) AS value,
-          days.date_measured AS date
-        FROM (
-            SELECT {coded_event_table}.Patient_ID, CAST(MAX(ConsultationDate) AS date) AS date_measured
-            FROM {coded_event_table}
-            {date_joins}
-            WHERE {coded_event_column} IN ({codelist_sql}) AND {date_condition}
-            GROUP BY {coded_event_table}.Patient_ID
-        ) AS days
-        LEFT JOIN {coded_event_table}
-        ON (
-          {coded_event_table}.Patient_ID = days.Patient_ID
-          AND {coded_event_table}.{coded_event_column} IN ({codelist_sql})
-          AND CAST({coded_event_table}.ConsultationDate AS date) = days.date_measured
+
+    def patients_min_recorded_value(
+        self,
+        codelist,
+        # What period is the mean over?
+        on_most_recent_day_of_measurement=None,
+        # Set date limits
+        between=None,
+        # Add additional columns indicating when measurement was taken
+        include_date_of_match=False,
+    ):
+        return self._summarised_recorded_value(
+            codelist,
+            on_most_recent_day_of_measurement,
+            between,
+            include_date_of_match,
+            "MIN",
         )
-        GROUP BY days.Patient_ID, days.date_measured
-        """
+
+    def patients_max_recorded_value(
+        self,
+        codelist,
+        # What period is the mean over?
+        on_most_recent_day_of_measurement=None,
+        # Set date limits
+        between=None,
+        # Add additional columns indicating when measurement was taken
+        include_date_of_match=False,
+    ):
+        return self._summarised_recorded_value(
+            codelist,
+            on_most_recent_day_of_measurement,
+            between,
+            include_date_of_match,
+            "MAX",
+        )
 
     def patients_registered_as_of(self, reference_date):
         """
@@ -894,17 +981,50 @@ class TPPBackend:
             assert not kwargs.pop("find_first_match_in_period", None)
             assert not kwargs.pop("find_last_match_in_period", None)
             assert not kwargs.pop("include_date_of_match", None)
+            assert not kwargs.pop("include_reference_range_columns", None)
             return self._number_of_episodes_by_clinical_event(
                 coded_event_table, coded_event_column, **kwargs
             )
         # This is the default code path for most queries
         else:
             assert not kwargs.pop("episode_defined_as", None)
+            if kwargs.pop("include_reference_range_columns", False):
+                additional_join = (
+                    f"\nLEFT JOIN CodedEventRange\n"
+                    f"ON CodedEventRange.CodedEvent_ID = {coded_event_table}.CodedEvent_ID\n"
+                )
+                comparator_case = """
+                CASE comparator
+                    WHEN 3 THEN '~'
+                    WHEN 4 THEN '='
+                    WHEN 5 THEN '>='
+                    WHEN 6 THEN '>'
+                    WHEN 7 THEN '<'
+                    WHEN 8 THEN '<='
+                    ELSE ''
+                END
+                """
+                additional_columns = (
+                    f"lower_bound,\n"
+                    f"upper_bound,\n"
+                    f"{comparator_case} AS comparator,\n"
+                )
+                additional_inner_columns = (
+                    "CodedEventRange.LowerBound AS lower_bound,\n"
+                    "CodedEventRange.UpperBound AS upper_bound,\n"
+                    "CodedEventRange.Comparator AS comparator,\n"
+                )
+            else:
+                additional_join = ""
+                additional_columns = ""
+                additional_inner_columns = ""
             return self._patients_with_events(
                 coded_event_table,
-                "",
+                additional_join,
                 coded_event_column,
                 codes_are_case_sensitive=True,
+                additional_columns=additional_columns,
+                additional_inner_columns=additional_inner_columns,
                 **kwargs,
             )
 
@@ -927,6 +1047,8 @@ class TPPBackend:
         returning="binary_flag",
         include_date_of_match=False,
         ignore_missing_values=False,
+        additional_columns="",
+        additional_inner_columns="",
     ):
         codelist_table, codelist_queries = self.create_codelist_table(
             codelist, codes_are_case_sensitive
@@ -953,7 +1075,9 @@ class TPPBackend:
         if returning == "binary_flag" or returning == "date":
             column_name = "binary_flag"
             column_definition = "1"
-            use_partition_query = False
+            # If we don't have any additional columns then we don't need a
+            # partion query, otherwise we do
+            use_partition_query = bool(additional_columns)
         elif returning == "number_of_matches_in_period":
             column_definition = "COUNT(*)"
             use_partition_query = False
@@ -984,12 +1108,14 @@ class TPPBackend:
             SELECT
               Patient_ID AS patient_id,
               {column_definition} AS {column_name},
+              {additional_columns}
               ConsultationDate AS date
             FROM (
               SELECT {from_table}.Patient_ID, {column_definition}, ConsultationDate,
+              {additional_inner_columns}
               ROW_NUMBER() OVER (
                 PARTITION BY {from_table}.Patient_ID
-                ORDER BY ConsultationDate {ordering}, {from_table_id_col}
+                ORDER BY ConsultationDate {ordering}, {from_table}.{from_table_id_col}
               ) AS rownum
               FROM {from_table}{additional_join}
               INNER JOIN {codelist_table}
@@ -1002,6 +1128,8 @@ class TPPBackend:
             WHERE rownum = 1
             """
         else:
+            assert not additional_columns
+
             sql = f"""
             SELECT
               {from_table}.Patient_ID AS patient_id,
@@ -1081,15 +1209,16 @@ class TPPBackend:
                     CalculationDateTime AS date
                 FROM (
                     SELECT
-                        Patient_ID,
+                        DecisionSupportValue.Patient_ID AS Patient_ID,
                         {value_column_expression},
                         CalculationDateTime,
                         ROW_NUMBER() OVER (
-                            PARTITION BY Patient_ID
-                            ORDER BY CalculationDateTime {ordering}, Patient_ID
+                            PARTITION BY DecisionSupportValue.Patient_ID
+                            ORDER BY CalculationDateTime {ordering}, DecisionSupportValue.Patient_ID
                         ) AS rownum
                     FROM
                         DecisionSupportValue
+                        {date_joins}
                     WHERE
                         AlgorithmType = {quote(algorithm_type_id)}
                         AND {date_condition}
@@ -1101,17 +1230,18 @@ class TPPBackend:
         else:
             sql = f"""
                 SELECT
-                    Patient_ID AS patient_id,
+                    DecisionSupportValue.Patient_ID AS patient_id,
                     {value_column_expression} AS {value_column_alias},
                     {date_aggregate}(CalculationDateTime) AS date
                 FROM
                     DecisionSupportValue
+                    {date_joins}
                 WHERE
                     AlgorithmType = {quote(algorithm_type_id)}
                     AND {date_condition}
                     AND {missing_values_condition}
                 GROUP BY
-                    Patient_ID
+                    DecisionSupportValue.Patient_ID
             """
         return [sql]
 
@@ -1264,7 +1394,9 @@ class TPPBackend:
         )
         queries += [
             f"""
-            SELECT Patient_ID, CAST(ConsultationDate AS date) AS day
+            SELECT
+              {coded_event_table}.Patient_ID AS Patient_ID,
+              CAST(ConsultationDate AS date) AS day
             INTO {same_day_table}
             FROM {coded_event_table}
             INNER JOIN {codelist_table}
@@ -1287,6 +1419,145 @@ class TPPBackend:
         return condition, queries
 
     def patients_registered_practice_as_of(self, date, returning=None):
+        # Note that current registrations are recorded with an EndDate of
+        # 9999-12-31. Where registration periods overlap we use the one with
+        # the most recent start date. If there are several with the same start
+        # date we use the longest one (i.e. with the latest end date).
+        date_sql, date_joins = self.get_date_sql("RegistrationHistory", date)
+
+        if "__" in returning:  # It's an RCT.
+            _, app_trial_name, app_property_name = returning.split("__")
+
+            # Here, we map from the app (i.e. cohort-extractor) to the DB, to give a
+            # cleaner interface e.g. without camel case variable names. We do, however,
+            # duplicate some of this information: You will find trial names and property
+            # names in cohortextractor.process_covariate_definitions. It would be good
+            # to refactor, moving them elsewhere.
+
+            # Maps from trial names used by the app to those used by the DB.
+            app_to_db_trial_name = {
+                "germdefence": "germdefence",
+            }
+            # Maps from property names used by the app to those used by the DB.
+            app_to_db_property_name = {
+                property.lower(): property
+                for property in [
+                    # Our internal properties
+                    "enrolled",
+                    "trial_arm",
+                    # Properties supplied by the RCT
+                    "Av_rooms_per_house",
+                    "deprivation_pctile",
+                    "group_mean_behaviour_mean",
+                    "group_mean_intention_mean",
+                    "hand_behav_practice_mean",
+                    "hand_intent_practice_mean",
+                    "IMD_decile",
+                    "IntCon",
+                    "MeanAge",
+                    "MedianAge",
+                    "Minority_ethnic_total",
+                    "N_completers_HW_behav",
+                    "N_completers_RI_behav",
+                    "N_completers_RI_intent",
+                    "n_engaged_pages_viewed_mean_mean",
+                    "n_engaged_visits_mean",
+                    "N_goalsetting_completers_per_practice",
+                    "n_pages_viewed_mean",
+                    "n_times_visited_mean",
+                    "N_visits_practice",
+                    "prop_engaged_visits",
+                    "total_visit_time_mean",
+                ]
+            }
+            try:
+                db_trial_name = app_to_db_trial_name[app_trial_name]
+            except KeyError:
+                raise ValueError(
+                    f"Unknown RCT '{app_trial_name}', available names are: "
+                    f"{', '.join(app_to_db_trial_name.keys())}"
+                )
+            try:
+                db_property_name = app_to_db_property_name[app_property_name]
+            except KeyError:
+                newline = "\n"
+                raise ValueError(
+                    f"Unknown property '{app_property_name}', available properties"
+                    f" are:\n{newline.join(app_to_db_trial_name.keys())}"
+                )
+
+            if app_property_name in ["enrolled", "trial_arm"]:
+                to_select = "1" if app_property_name == "enrolled" else "TrialArm"
+
+                return f"""
+                SELECT
+                    Patient_ID AS patient_id,
+                    {to_select} AS {returning}
+                FROM
+                    ClusterRandomisedTrial AS lhs
+                LEFT JOIN (
+                    SELECT
+                        Patient_ID,
+                        Organisation_ID,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY Patient_ID
+                            ORDER BY StartDate DESC, EndDate DESC, Registration_ID
+                        ) AS rownum
+                    FROM
+                        RegistrationHistory
+                        {date_joins}
+                    WHERE
+                        StartDate <= {date_sql}
+                        AND EndDate > {date_sql}
+                ) AS rhs
+                ON lhs.Organisation_ID = rhs.Organisation_ID
+                WHERE
+                    rownum = 1
+                    AND TrialNumber IN (
+                        SELECT
+                            TrialNumber
+                        FROM
+                            ClusterRandomisedTrialReference
+                        WHERE
+                            TrialName = '{db_trial_name}'
+                    )
+                """
+            else:
+                return f"""
+                SELECT
+                    Patient_ID AS patient_id,
+                    PropertyValue AS {returning}
+                FROM
+                    ClusterRandomisedTrialDetail as lhs
+                LEFT JOIN (
+                    SELECT
+                        Patient_ID,
+                        Organisation_ID,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY Patient_ID
+                            ORDER BY StartDate DESC, EndDate DESC, Registration_ID
+                        ) AS rownum
+                    FROM
+                        RegistrationHistory
+                        {date_joins}
+                    WHERE
+                        StartDate <= {date_sql}
+                        AND EndDate > {date_sql}
+                ) rhs
+                ON lhs.Organisation_ID = rhs.Organisation_ID
+                WHERE
+                    Property = '{db_property_name}'
+                    AND rownum = 1
+                    AND TrialNumber IN (
+                        SELECT
+                            TrialNumber
+                        FROM
+                            ClusterRandomisedTrialReference
+                        WHERE
+                            TrialName = '{db_trial_name}'
+                    )
+                """
+
         if returning == "stp_code":
             column = "STPCode"
         # "msoa" is the correct option here, "msoa_code" is supported for
@@ -1299,11 +1570,6 @@ class TPPBackend:
             column = "Organisation_ID"
         else:
             raise ValueError(f"Unsupported `returning` value: {returning}")
-        # Note that current registrations are recorded with an EndDate of
-        # 9999-12-31. Where registration periods overlap we use the one with
-        # the most recent start date. If there are several with the same start
-        # date we use the longest one (i.e. with the latest end date).
-        date_sql, date_joins = self.get_date_sql("RegistrationHistory", date)
         return f"""
         SELECT
           t.Patient_ID AS patient_id,
@@ -1538,6 +1804,8 @@ class TPPBackend:
             column_definition = "MIN(dod)"
         elif returning == "underlying_cause_of_death":
             column_definition = "MIN(icd10u)"
+        elif returning == "place_of_death":
+            column_definition = "MIN(Place_of_occurrence)"
         else:
             raise ValueError(f"Unsupported `returning` value: {returning}")
         return f"""
@@ -1790,7 +2058,18 @@ class TPPBackend:
             )
 
         if (
-            returning in ("variant", "variant_detection_method")
+            returning == "number_of_matches_in_period"
+            and restrict_to_earliest_specimen_date is not False
+        ):
+            raise ValueError(
+                "Due to limitations in the SGSS data we receive you can only use:\n"
+                "  returning = 'number_of_matches_in_period'\n"
+                "with the options:\n"
+                "  restrict_to_earliest_specimen_date = False\n"
+            )
+
+        if (
+            returning in ("variant", "variant_detection_method", "symptomatic")
             and restrict_to_earliest_specimen_date
         ):
             raise ValueError(
@@ -1799,6 +2078,8 @@ class TPPBackend:
                 f"with the option:\n"
                 f"  restrict_to_earliest_specimen_date = False\n"
             )
+
+        use_partition_query = True
 
         if returning == "binary_flag":
             column = "1"
@@ -1830,6 +2111,34 @@ class TPPBackend:
             column = f"CASE {case_clauses} ELSE {raw_column} END"
         elif returning == "variant_detection_method":
             column = "t2.variant_detection_method"
+        elif returning == "symptomatic":
+            raw_column = "t2.symptomatic"
+            transforms = {
+                # From SGSS_AllTests_Positive table.
+                "N": "N",
+                "U": "",
+                "Y": "Y",
+                # From SGSS_AllTests_Negative table.
+                "false": "N",
+                "true": "Y",
+            }
+            case_clauses = "\n".join(
+                [
+                    f"WHEN {raw_column} = {quote(key)} THEN {quote(value)}"
+                    for (key, value) in transforms.items()
+                ]
+                # As per #581, we only have nulls in the SGSS_AllTests_Negative table.
+                # However, it seems reasonable to apply this condition to both the
+                # SGSS_AllTests_Positive and SGSS_AllTests_Negative table.
+                # If nulls did appear in the SGSS_AllTests_Negative table, presumably
+                # we would want the same behaviour. Therefore, we can just add this
+                # extra clause unconditionally.
+                + [f"WHEN {raw_column} IS NULL THEN {quote('')}"]
+            )
+            column = f"CASE {case_clauses} ELSE {raw_column} END"
+        elif returning == "number_of_matches_in_period":
+            column = "COUNT(*)"
+            use_partition_query = False
         else:
             raise ValueError(f"Unsupported `returning` value: {returning}")
 
@@ -1856,7 +2165,8 @@ class TPPBackend:
               Patient_ID AS patient_id,
               Specimen_Date AS date,
               Variant AS variant,
-              VariantDetectionMethod AS variant_detection_method
+              VariantDetectionMethod AS variant_detection_method,
+              Symptomatic AS symptomatic
             FROM SGSS_AllTests_Positive
             """
             negative_query = """
@@ -1864,7 +2174,8 @@ class TPPBackend:
               Patient_ID AS patient_id,
               Specimen_Date AS date,
               '' AS variant,
-              '' AS variant_detection_method
+              '' AS variant_detection_method,
+              Symptomatic AS symptomatic
             FROM SGSS_AllTests_Negative
             """
 
@@ -1880,25 +2191,36 @@ class TPPBackend:
         date_condition, date_joins = self.get_date_condition("t1", "t1.date", between)
         date_ordering = "ASC" if find_first_match_in_period else "DESC"
 
-        return f"""
-        SELECT
-          t2.patient_id AS patient_id,
-          t2.date AS date,
-          {column} AS {returning}
-        FROM (
-          SELECT t1.*,
-            ROW_NUMBER() OVER (
-              PARTITION BY t1.patient_id
-              ORDER BY t1.date {date_ordering}
-            ) AS rownum
-          FROM (
-            {table_query}
-          ) t1
-          {date_joins}
-          WHERE {date_condition}
-        ) t2
-        WHERE t2.rownum = 1
-        """
+        if use_partition_query:
+            return f"""
+            SELECT
+              t2.patient_id AS patient_id,
+              t2.date AS date,
+              {column} AS {returning}
+            FROM (
+              SELECT t1.*,
+                ROW_NUMBER() OVER (
+                  PARTITION BY t1.patient_id
+                  ORDER BY t1.date {date_ordering}
+                ) AS rownum
+              FROM (
+                {table_query}
+              ) t1
+              {date_joins}
+              WHERE {date_condition}
+            ) t2
+            WHERE t2.rownum = 1
+            """
+        else:
+            return f"""
+            SELECT
+              t1.patient_id AS patient_id,
+              {column} AS {returning}
+            FROM ({table_query}) t1
+            {date_joins}
+            WHERE {date_condition}
+            GROUP BY t1.patient_id
+            """
 
     def patients_household_as_of(self, reference_date, returning):
         if reference_date != "2020-02-01":
@@ -2090,7 +2412,7 @@ class TPPBackend:
         if with_these_primary_diagnoses:
             assert with_these_primary_diagnoses.system == "icd10"
             fragments = [
-                f"APCS_Der.Spell_Primary_Diagnosis LIKE {pattern} ESCAPE '\\'"
+                f"APCS_Der.Spell_Primary_Diagnosis LIKE {pattern} ESCAPE '!'"
                 for pattern in codelist_to_like_patterns(
                     with_these_primary_diagnoses, prefix="", suffix="%"
                 )
@@ -2100,7 +2422,7 @@ class TPPBackend:
         if with_these_diagnoses:
             assert with_these_diagnoses.system == "icd10"
             fragments = [
-                f"Der_Diagnosis_All LIKE {pattern} ESCAPE '\\'"
+                f"Der_Diagnosis_All LIKE {pattern} ESCAPE '!'"
                 for pattern in codelist_to_like_patterns(
                     with_these_diagnoses, prefix="%[^A-Za-z0-9]", suffix="%"
                 )
@@ -2110,7 +2432,7 @@ class TPPBackend:
         if with_these_procedures:
             assert with_these_procedures.system == "opcs4"
             fragments = [
-                f"Der_Procedure_All LIKE {pattern} ESCAPE '\\'"
+                f"Der_Procedure_All LIKE {pattern} ESCAPE '!'"
                 for pattern in codelist_to_like_patterns(
                     with_these_procedures, prefix="%[^A-Za-z0-9]", suffix="%"
                 )
@@ -2339,6 +2661,218 @@ class TPPBackend:
         """
         return sql
 
+    def patients_with_healthcare_worker_flag_on_covid_vaccine_record(self, returning):
+        assert returning == "binary_flag"
+        return """
+        SELECT
+          Patient_ID as patient_id,
+          1 as binary_flag
+        FROM
+          HealthCareWorker
+        WHERE
+          HealthCareWorker.HealthCareWorker = 'Y'
+        GROUP BY
+          patient_id
+        """
+
+    def patients_outpatient_appointment_date(
+        self,
+        attended=None,
+        is_first_attendance=None,
+        with_these_treatment_function_codes=None,
+        with_these_procedures=None,
+        between=None,
+        find_first_match_in_period=None,
+        returning="binary_flag",
+    ):
+        date_condition, date_joins = self.get_date_condition(
+            "OPA", "Appointment_Date", between
+        )
+
+        conditions = [date_condition]
+
+        if attended:
+            # codes from `ATTENDED` field in HES data dictionary
+            # https://github.com/opensafely-core/cohort-extractor/issues/492#issuecomment-888961963
+            attended_conditions = [
+                "Attendance_Status = 5",
+                "Attendance_Status = 6",
+            ]
+            conditions.append("(" + " OR ".join(attended_conditions) + ")")
+
+        if is_first_attendance:
+            # codes from `FIRSTATT` field in HES data dictionary
+            # https://github.com/opensafely-core/cohort-extractor/issues/492#issuecomment-889017544
+            is_first_attendance_conditions = [
+                "First_Attendance = 1",
+                "First_Attendance = 3",
+            ]
+            conditions.append("(" + " OR ".join(is_first_attendance_conditions) + ")")
+
+        if with_these_treatment_function_codes:
+            with_these_treatment_function_codes_conditions = codelist_to_sql(
+                with_these_treatment_function_codes
+            )
+            conditions.append(
+                f"""Treatment_Function_Code IN ({with_these_treatment_function_codes_conditions})"""
+            )
+
+        procedures_joins = ""
+        if with_these_procedures:
+            assert with_these_procedures.system == "opcs4"
+            fragments = [
+                f"OPA_Proc.Primary_Procedure_Code LIKE {pattern} ESCAPE '!'"
+                for pattern in codelist_to_like_patterns(
+                    with_these_procedures, prefix="%", suffix="%"
+                )
+            ]
+            conditions.append("(" + " OR ".join(fragments) + ")")
+            procedures_joins = "JOIN OPA_Proc ON OPA.OPA_Ident = OPA_Proc.OPA_Ident"
+
+        conditions = " AND ".join(conditions)
+
+        # Result ordering
+        if find_first_match_in_period:
+            ordering = "ASC"
+            date_aggregate = "MIN"
+        else:
+            ordering = "DESC"
+            date_aggregate = "MAX"
+
+        use_partition_query = False
+
+        if returning == "binary_flag":
+            column_definition = "1"
+        elif returning == "date":
+            column_definition = f"""{date_aggregate}(Appointment_Date)"""
+        elif returning == "number_of_matches_in_period":
+            column_definition = "COUNT(OPA_Ident)"
+        elif returning == "consultation_medium_used":
+            column_definition = "Consultation_Medium_Used"
+            use_partition_query = True
+        else:
+            raise ValueError(f"Unsupported `returning` value: {returning}")
+
+        if use_partition_query:
+            return f"""
+            SELECT
+              t.Patient_ID AS patient_id,
+              t.{column_definition} AS {returning}
+            FROM (
+              SELECT
+                OPA.Patient_ID,
+                {column_definition} AS {returning},
+                ROW_NUMBER() OVER (
+                  PARTITION BY OPA.Patient_ID
+                  ORDER BY Appointment_Date {ordering}
+                ) AS rownum
+              FROM OPA
+              {date_joins}
+              {procedures_joins}
+              WHERE {conditions}
+            ) t
+            WHERE rownum = 1
+            """
+        else:
+            return f"""
+            SELECT
+              OPA.Patient_ID AS patient_id,
+              {column_definition} AS {returning}
+            FROM
+              OPA
+              {date_joins}
+              {procedures_joins}
+            WHERE {conditions}
+            GROUP BY
+              OPA.Patient_ID
+            """
+
+    def patients_with_value_from_file(
+        self, f_path, returning=None, returning_type=None
+    ):
+        if not is_csv_filename(f_path):
+            raise TypeError(f"Unexpected file type {f_path}")
+
+        if returning is not None and returning_type is None:
+            # StudyDefinition.get_pandas_csv_args() should have raised an error before
+            # we reach here.
+            raise TypeError(
+                "If `returning` is passed, then `returning_type` must be passed"
+            )
+
+        if returning is None and returning_type is not None:
+            raise TypeError(
+                "If `returning_type` is passed, then `returning` must be passed"
+            )
+
+        # Compiled patterns passed to the module-level matching functions are
+        # cached. As we don't use many patterns, we need not worry
+        # about compiling them first.
+        if returning is not None and not re.fullmatch(r"\w+", returning, re.ASCII):
+            raise ValueError(
+                "The column name given by `returning` should contain only alphanumeric characters and the underscore character"
+            )
+
+        # Fail before reading the CSV file
+        if returning_type == "bool" or returning_type is None:
+            column_type = "INT"
+        elif returning_type == "date":
+            column_type = "DATE"
+        elif returning_type == "str":
+            column_type = "VARCHAR(MAX)"
+        elif returning_type == "int":
+            column_type = "INT"
+        elif returning_type == "float":
+            column_type = "FLOAT"
+        else:
+            # StudyDefinition.get_pandas_csv_args() should have raised an error before
+            # we reach here.
+            raise TypeError(f"Unexpected type {returning_type}")
+
+        # Which columns of the CSV file should we read?
+        usecols = ["patient_id"]
+        if returning is not None:
+            usecols.append(returning)
+
+        # Read the CSV file into a data frame
+        values = pandas.read_csv(
+            f_path, index_col="patient_id", usecols=usecols, dtype=str
+        )
+
+        if returning is None:
+            # Adding a dummy column here makes it easier to generate the SQL
+            values["value"] = 1
+            returning = "value"
+
+        # Generate the SQL
+        table_name = self.get_temp_table_name("file")
+        queries = [
+            f"""
+            -- Uploading file for {returning}
+            CREATE TABLE {table_name} (
+                patient_id BIGINT,
+                {returning} {column_type}
+            )
+            """,
+        ]
+        queries += make_batches_of_insert_statements(
+            table_name, ("patient_id", returning), list(values.itertuples())
+        )
+        queries.append(
+            f"""
+            SELECT
+                patient_id,
+                {returning}
+            FROM
+                {table_name}
+            """
+        )
+
+        return queries
+
+    def patients_which_exist_in_file(self, f_path):
+        return self.patients_with_value_from_file(f_path)
+
 
 class ColumnExpression:
     def __init__(
@@ -2385,7 +2919,7 @@ def codelist_to_like_patterns(codelist, prefix="", suffix=""):
 
 # Special characters from:
 # https://docs.microsoft.com/en-us/sql/t-sql/language-elements/like-transact-sql?view=sql-server-ver15
-LIKE_ESCAPE_TABLE = str.maketrans({char: f"\\{char}" for char in "%_[]^"})
+LIKE_ESCAPE_TABLE = str.maketrans({char: f"!{char}" for char in "%_[]^"})
 
 
 def escape_like_query_fragment(text):
@@ -2424,12 +2958,13 @@ def is_iso_date(value):
     return bool(re.match(r"\d\d\d\d-\d\d-\d\d", value))
 
 
-def quote(value):
+def quote(value, reformat_dates=True):
     if isinstance(value, (int, float)):
         return str(value)
     else:
         value = str(value)
-        value = standardise_if_date(value)
+        if reformat_dates:
+            value = standardise_if_date(value)
         # This looks a bit too simple but it's what SQLAlchemy does and it is,
         # as far as I can tell, all you need to do to encode string literals.
         # https://github.com/sqlalchemy/sqlalchemy/blob/ac1228a872/lib/sqlalchemy/dialects/mssql/base.py#L1117-L1127
@@ -2471,6 +3006,23 @@ def pop_keys_from_dict(dictionary, keys):
         if key in dictionary:
             new_dict[key] = dictionary.pop(key)
     return new_dict
+
+
+def make_batches_of_insert_statements(table_name, column_names, values):
+    column_names_sql = ", ".join(column_names)
+    insert_sql = f"INSERT INTO {table_name} ({column_names_sql}) VALUES"
+
+    # There's a limit on how many rows we can insert in one go using this method.
+    # See: https://docs.microsoft.com/en-us/sql/t-sql/queries/table-value-constructor-transact-sql?view=sql-server-ver15#limitations-and-restrictions
+    batch_size = 999
+    batches = []
+    for i in range(0, len(values), batch_size):
+        values_batch = values[i : i + batch_size]
+        values_sql_lines = ["({}, {})".format(*map(quote, row)) for row in values_batch]
+        values_sql = ",\n".join(values_sql_lines)
+        batches.append(f"{insert_sql}\n{values_sql}")
+
+    return batches
 
 
 class AppointmentStatus(enum.IntEnum):

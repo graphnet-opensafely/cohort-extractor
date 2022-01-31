@@ -1,4 +1,10 @@
+import functools
+import math
+
 import pandas
+import structlog
+
+logger = structlog.get_logger()
 
 
 def dataframe_to_file(df, filename):
@@ -29,6 +35,11 @@ def dataframe_to_file(df, filename):
         raise RuntimeError(f"Unsupported file format: {filename}")
 
 
+def dataframe_to_rows(df):
+    yield df.columns
+    yield from df.to_records(index=False)
+
+
 def dataframe_from_rows(covariate_definitions, rows):
     """
     Create a DataFrame from an iterator of rows
@@ -39,14 +50,24 @@ def dataframe_from_rows(covariate_definitions, rows):
     }
     # `patient_id` isn't included in `covariate_definitions` so we need to add
     # it manually
-    convertors["patient_id"] = identity
+    convertors["patient_id"] = int
 
     # First row is expected to be header row
     headers = next(rows)
     convertor_funcs = [convertors[column] for column in headers]
 
     def convert_row(row):
-        return [convertor(value) for (convertor, value) in zip(convertor_funcs, row)]
+        new_row = []
+        for convertor, value, header in zip(convertor_funcs, row, headers):
+            try:
+                new_row.append(convertor(value))
+            except Exception:
+                # add some debugging context that pandas error wont have
+                logger.error(
+                    f"pandas error converting column {header} with converter {convertor} with values {value}"
+                )
+                raise
+        return new_row
 
     data = map(convert_row, rows)
     df = pandas.DataFrame(data, columns=headers)
@@ -82,8 +103,10 @@ def get_pandas_convertor(funcname, column_type=None, returning=None, **kwargs):
         return bool
     elif column_type == "str":
         return Categoriser()
-    elif column_type in ("int", "float"):
-        return identity
+    elif column_type == "int":
+        return lambda val: int(val) if val else val
+    elif column_type == "float":
+        return lambda val: float(val) if val else val
     else:
         raise ValueError(f"Unable to impute Pandas type for {column_type} ({funcname})")
 
@@ -95,7 +118,7 @@ class Categoriser(dict):
     __call__ = dict.__getitem__
 
     def __missing__(self, value):
-        if value:
+        if is_not_empty(value):
             index = self.counter
             self.counter += 1
         else:
@@ -108,8 +131,15 @@ class Categoriser(dict):
         return [key for (index, key) in enumerated if index > -1]
 
 
-def identity(value):
-    return value
+def is_not_empty(value):
+    """
+    We regard falsey and NaN values as empty
+    """
+    if not value:
+        return False
+    if isinstance(value, float) and math.isnan(value):
+        return False
+    return True
 
 
 def memoize(fn):
@@ -119,7 +149,32 @@ def memoize(fn):
             self[key] = value
             return value
 
-    return cache().__getitem__
+    c = cache()
+
+    # more helpful debugging wrapper
+    @functools.wraps(fn)
+    def wrapper(key):
+        return c.__getitem__(key)
+
+    return wrapper
 
 
-to_datetime = memoize(pandas.to_datetime)
+# dates that different systems use to represent the max date, but are greater
+# than pandas.Timestamp can represent, so we clamp to pandas.Timestamp.max
+MAX_DATES = [
+    # TPP
+    "9999-12-31",
+    "9999-12-31 00:00:00",
+]
+
+
+@memoize
+def to_datetime(datestr):
+    try:
+        return pandas.to_datetime(datestr)
+    except pandas.errors.OutOfBoundsDatetime:
+        if datestr in MAX_DATES:
+            # clamp to pandas max
+            return pandas.Timestamp.max
+        else:
+            raise

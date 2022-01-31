@@ -2,8 +2,11 @@ import os
 
 from setuptools import find_packages, setup
 
-with open(os.path.join("cohortextractor", "VERSION")) as f:
-    version = f.read().strip()
+try:
+    with open(os.path.join("cohortextractor", "VERSION")) as f:
+        version = f.read().strip()
+except Exception:
+    version = "99.99.99.dev1"
 
 setup(
     name="opensafely-cohort-extractor",
@@ -15,10 +18,7 @@ setup(
     python_requires=">=3.7",
     install_requires=[
         "lz4",
-        "opensafely-jobrunner>=2.0,<3.0",
         "pandas",
-        "presto-python-client",
-        "prettytable",
         "pyarrow",
         "pyyaml",
         "requests",
@@ -31,6 +31,14 @@ setup(
         "tabulate",
         "tinynetrc",
     ],
+    extras_require={
+        "drivers": [
+            # Used by the EMIS backend
+            "presto-python-client",
+            # Used by the TPP backend
+            "pymssql",
+        ]
+    },
     entry_points={
         "console_scripts": ["cohortextractor=cohortextractor.cohortextractor:main"]
     },

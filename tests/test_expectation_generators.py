@@ -293,7 +293,7 @@ def test_data_generator_float():
     assert abs(35 - int(nonzero_results["float"].mean())) < 5
 
 
-def test_data_generator_int():
+def test_data_generator_int_normal():
     population_size = 10000
     incidence = 0.9
     return_expectations = {
@@ -304,6 +304,19 @@ def test_data_generator_int():
     }
     result = generate(population_size, **return_expectations)
     assert abs(10 - int(result["int"].mean())) < 3
+
+
+def test_data_generator_int_poisson():
+    population_size = 10000
+    incidence = 0.9
+    return_expectations = {
+        "rate": "exponential_increase",
+        "incidence": incidence,
+        "date": {"earliest": "1900-01-01", "latest": "2020-01-01"},
+        "int": {"distribution": "poisson", "mean": 5},
+    }
+    result = generate(population_size, **return_expectations)
+    assert abs(5 - int(result["int"].mean())) < 3
 
 
 def test_data_generator_bool():
@@ -819,6 +832,7 @@ def test_make_df_from_expectations_with_deregistration_date():
 
 
 def test_make_df_from_expectations_with_aggregate_of():
+    # aggregate of variables defined in their own right
     study = StudyDefinition(
         default_expectations={
             "date": {"earliest": "1900-01-01", "latest": "today"},
@@ -836,8 +850,32 @@ def test_make_df_from_expectations_with_aggregate_of():
             returning="date",
             date_format="YYYY-MM-DD",
         ),
-        date_min=patients.minimum_of("date_1", "date_2"),
-        date_max=patients.maximum_of("date_1", "date_2"),
+        date_min=patients.minimum_of(
+            "date_1",
+            "date_2",
+        ),
+        date_max=patients.maximum_of(
+            "date_1",
+            "date_2",
+        ),
+        int_1=patients.with_these_clinical_events(
+            codelist(["X"], system="ctv3"),
+            returning="number_of_matches_in_period",
+            return_expectations={
+                "int": {"distribution": "normal", "mean": 25, "stddev": 5},
+                "incidence": 0.5,
+            },
+        ),
+        int_2=patients.with_these_clinical_events(
+            codelist(["X"], system="ctv3"),
+            returning="number_of_matches_in_period",
+            return_expectations={
+                "int": {"distribution": "normal", "mean": 25, "stddev": 5},
+                "incidence": 0.5,
+            },
+        ),
+        int_min=patients.minimum_of("int_1", "int_2"),
+        int_max=patients.maximum_of("int_1", "int_2"),
     )
     population_size = 10000
     result = study.make_df_from_expectations(population_size)
@@ -852,9 +890,233 @@ def test_make_df_from_expectations_with_aggregate_of():
             date_max = float("nan")
         assert_nan_equal(row["date_min"], date_min)
         assert_nan_equal(row["date_max"], date_max)
+        ints = [i for i in [row["int_1"], row["int_2"]] if isinstance(i, int)]
+        if ints:
+            int_min = min(ints)
+            int_max = max(ints)
+        else:
+            int_min = float("nan")
+            int_max = float("nan")
+        assert_nan_equal(row["int_min"], int_min)
+        assert_nan_equal(row["int_max"], int_max)
+
+    # aggregate of variables defined only within aggregate function
+    study = StudyDefinition(
+        default_expectations={
+            "date": {"earliest": "1900-01-01", "latest": "today"},
+            "rate": "exponential_increase",
+            "incidence": 1,
+        },
+        # We use an expression here (never mind that it's a trivial and
+        # pointless one) as that triggers a bug which we want to ensure we've
+        # fixed
+        population=patients.satisfying(
+            "foo OR bar", foo=patients.all(), bar=patients.all()
+        ),
+        date_min=patients.maximum_of(
+            date_1=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="date",
+                date_format="YYYY-MM-DD",
+            ),
+            date_2=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="date",
+                date_format="YYYY-MM-DD",
+            ),
+        ),
+        date_max=patients.maximum_of(
+            date_3=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="date",
+                date_format="YYYY-MM-DD",
+            ),
+            date_4=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="date",
+                date_format="YYYY-MM-DD",
+            ),
+        ),
+        int_min=patients.minimum_of(
+            int_1=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="number_of_matches_in_period",
+                return_expectations={
+                    "int": {"distribution": "normal", "mean": 25, "stddev": 5},
+                    "incidence": 0.5,
+                },
+            ),
+            int_2=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="number_of_matches_in_period",
+                return_expectations={
+                    "int": {"distribution": "normal", "mean": 25, "stddev": 5},
+                    "incidence": 0.5,
+                },
+            ),
+        ),
+        int_max=patients.maximum_of(
+            int_3=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="number_of_matches_in_period",
+                return_expectations={
+                    "int": {"distribution": "normal", "mean": 25, "stddev": 5},
+                    "incidence": 0.5,
+                },
+            ),
+            int_4=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="number_of_matches_in_period",
+                return_expectations={
+                    "int": {"distribution": "normal", "mean": 25, "stddev": 5},
+                    "incidence": 0.5,
+                },
+            ),
+        ),
+    )
+    population_size = 10000
+    result = study.make_df_from_expectations(population_size)
+    for _, row in result.iterrows():
+        print(row)
+        assert pd.notna(row["date_min"])
+        assert pd.notna(row["date_max"])
+        assert pd.notna(row["int_min"])
+        assert pd.notna(row["int_max"])
+
+    # aggregate of variables defined both inside and outside aggregation
+    study = StudyDefinition(
+        default_expectations={
+            "date": {"earliest": "1900-01-01", "latest": "today"},
+            "rate": "exponential_increase",
+            "incidence": 0.2,
+        },
+        population=patients.all(),
+        date_1=patients.with_these_clinical_events(
+            codelist(["X"], system="ctv3"),
+            returning="date",
+            date_format="YYYY-MM-DD",
+        ),
+        date_2=patients.with_these_clinical_events(
+            codelist(["X"], system="ctv3"),
+            returning="date",
+            date_format="YYYY-MM-DD",
+        ),
+        date_min=patients.minimum_of(
+            "date_1",
+            "date_2",
+            date_3=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="date",
+                date_format="YYYY-MM-DD",
+            ),
+        ),
+        date_max=patients.maximum_of(
+            "date_1",
+            "date_2",
+            date_4=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="date",
+                date_format="YYYY-MM-DD",
+            ),
+        ),
+        int_1=patients.with_these_clinical_events(
+            codelist(["X"], system="ctv3"),
+            returning="number_of_matches_in_period",
+            return_expectations={
+                "int": {"distribution": "normal", "mean": 25, "stddev": 5},
+                "incidence": 0.5,
+            },
+        ),
+        int_2=patients.with_these_clinical_events(
+            codelist(["X"], system="ctv3"),
+            returning="number_of_matches_in_period",
+            return_expectations={
+                "int": {"distribution": "normal", "mean": 25, "stddev": 5},
+                "incidence": 0.5,
+            },
+        ),
+        int_min=patients.minimum_of(
+            "int_1",
+            "int_2",
+            int_3=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="number_of_matches_in_period",
+                return_expectations={
+                    "int": {"distribution": "normal", "mean": 25, "stddev": 5},
+                    "incidence": 0.5,
+                },
+            ),
+        ),
+        int_max=patients.maximum_of(
+            "int_1",
+            "int_2",
+            int_4=patients.with_these_clinical_events(
+                codelist(["X"], system="ctv3"),
+                returning="number_of_matches_in_period",
+                return_expectations={
+                    "int": {"distribution": "normal", "mean": 25, "stddev": 5},
+                    "incidence": 0.5,
+                },
+            ),
+        ),
+    )
+    population_size = 10000
+    result = study.make_df_from_expectations(population_size)
+    for _, row in result.iterrows():
+        print(row)
+        dates = [d for d in [row["date_1"], row["date_2"]] if isinstance(d, str)]
+        if dates:
+            date_min = min(dates)
+            date_max = max(dates)
+        else:
+            date_min = float("nan")
+            date_max = float("nan")
+        assert_nan_equal(row["date_min"], date_min)
+        assert_nan_equal(row["date_max"], date_max)
+        ints = [i for i in [row["int_1"], row["int_2"]] if isinstance(i, int)]
+        if ints:
+            int_min = min(ints)
+            int_max = max(ints)
+        else:
+            int_min = float("nan")
+            int_max = float("nan")
+        assert_nan_equal(row["int_min"], int_min)
+        assert_nan_equal(row["int_max"], int_max)
 
 
 def assert_nan_equal(v1, v2):
     assert (
         not isinstance(v1, str) and not isinstance(v2, str) and isnan(v1) and isnan(v2)
     ) or v1 == v2
+
+
+def test_make_df_from_expectations_with_using_dates_as_categories():
+    study = StudyDefinition(
+        default_expectations={
+            "date": {"earliest": "1900-01-01", "latest": "today"},
+            "rate": "exponential_increase",
+            "incidence": 0.2,
+        },
+        population=patients.all(),
+        eligible_date=patients.categorised_as(
+            {
+                "2020-04-14": "age >= 80",
+                "2020-06-16": "age >= 70 AND age < 80",
+                "2020-08-18": "DEFAULT",
+            },
+            age=patients.age_as_of("2020-01-01"),
+            return_expectations={
+                "category": {
+                    "ratios": {
+                        "2020-04-14": 0.25,
+                        "2020-06-16": 0.25,
+                        "2020-08-18": 0.5,
+                    }
+                },
+                "incidence": 1,
+            },
+        ),
+    )
+    population_size = 100
+    result = study.make_df_from_expectations(population_size)
+    assert set(result.eligible_date) == set(["2020-08-18", "2020-06-16", "2020-04-14"])
